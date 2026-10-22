@@ -57,7 +57,9 @@ savage_wind/extracted/
   romfs/   contenido completo de la romfs (base + actualización ya fusionadas)
 ```
 
-La versión objetivo es la 1.8.2 (versión de título v1048576), la última. El build id del módulo `main`
+La versión objetivo es la 1.9.0 (versión de título v1114112, SDK 21.4.1), la última; hasta el 2026-10-22 fue la
+1.8.2 (v1048576, build `de0b6ac4efc1dda7`), y los parches y direcciones de `tools/patches.py` y del runtime se
+volvieron a localizar en el `main` de 1.9.0 (build `cd57b23fa4bbad65`). El build id del módulo `main`
 identifica la versión exacta; `tools/sw_probe.py` lo imprime.
 
 ## Cambios respecto de LASRecomp

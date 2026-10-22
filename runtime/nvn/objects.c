@@ -1045,7 +1045,8 @@ NVN(nvnWindowGetNumTextures) { RET(WIN->num); }
 NVN(nvnWindowGetNumActiveTextures) { RET(WIN->active); }
 NVN(nvnWindowSetNumActiveTextures) { WIN->active = (int)A(1); }
 NVN(nvnWindowGetPresentInterval) { RET(WIN->interval); }
-// BOTW's frame loop (sead GameFrameworkNx, main 0x700101287c) sets the interval here every frame (lr 0x7001012a34,
+// BOTW's frame loop (sead GameFrameworkNx, main 0x700112660c in 1.9.0) sets the interval here every frame (through its
+// vtable +0x130 and the Window wrapper 0x7000e9af20, both tail calls: lr 0x70011267c4,
 // x19 = the framework). It times each frame ([fw+0x250], 19.2 MHz system ticks, from the frame's start to the end of
 // its calc and draw) and goes to interval 3 (20 fps) after three frames in a row over 1.9 vsyncs (31.7 ms), back to
 // 2 after a few fast ones; [fw+0x234] is the highest interval it may pick (3).
@@ -1053,7 +1054,7 @@ NVN(nvnWindowGetPresentInterval) { RET(WIN->interval); }
 // SAVAGEWIND_MAX_INTERVAL=2: the game never picks 3, so its step per frame is fixed and a scripted run takes the same
 // path every time (benchmarks; with 3 allowed, the path depends on the frame times). The default while Savage Wind
 // paces the frames and sets the game's clock (runtime/hle/framepace.c): the interval no longer sets either.
-#define FRAME_LOOP_LR 0x7001012a34ull
+#define FRAME_LOOP_LR 0x70011267c4ull
 NVN(nvnWindowSetPresentInterval) {
     int want = (int)A(1);
     if (c->x[30] == FRAME_LOOP_LR) {

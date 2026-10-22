@@ -6,7 +6,7 @@
 // the title menu's amiibo settings) asks with the game's own dialog: desktop or the Savage Wind start screen.
 //
 // The game side (tools/patches.py): the screen builds one row per entry of a static option table each time it opens
-// (entries through 0x7001cccda0 / count 0x7001cccd98, row order through 0x7001cccdb0 / count 0x7001cccda8). The
+// (entries through 0x7001e2e618 / count 0x7001e2e610, row order through 0x7001e2e628 / count 0x7001e2e620). The
 // first time it opens, the table is pointed at a copy with this file's entries after the game's 14; each opening then
 // gets the row order of the page asked for. Rows of these entries have their value, texts and A handled here. A page
 // change closes the screen; the title menu's update (rt_opt_title_tick) or the pause System page's Options state
@@ -47,12 +47,12 @@ void wr8(uint64_t a, uint8_t v) { *(volatile uint8_t *)(uintptr_t)a = v; }
 void wr32(uint64_t a, uint32_t v) { *(volatile uint32_t *)(uintptr_t)a = v; }
 void wr64(uint64_t a, uint64_t v) { *(volatile uint64_t *)(uintptr_t)a = v; }
 
-const uint64_t OPT_COUNT = 0x7001cccd98, OPT_ENTRIES = 0x7001cccda0, OPT_ROWS = 0x7001cccda8, OPT_ORDER = 0x7001cccdb0;
-const uint64_t SCREEN_MGR = 0x7001cd5c38;  // ScreenMgr *: +0x28 screen count, +0x30 screen pointers by id
+const uint64_t OPT_COUNT = 0x7001e2e610, OPT_ENTRIES = 0x7001e2e618, OPT_ROWS = 0x7001e2e620, OPT_ORDER = 0x7001e2e628;
+const uint64_t SCREEN_MGR = 0x7001e374b8;  // ScreenMgr *: +0x28 screen count, +0x30 screen pointers by id
 const uint32_t SCREEN_OPTIONS = 0x34;
-const uint32_t MENU_OPTIONS_ACTIVE = 0x6a;  // title menu +0x363c while its Options button's screen is up
+const uint32_t MENU_OPTIONS_ACTIVE = 0x6a;  // title menu +0x3654 while its Options button's screen is up
 const uint32_t SCREEN_DIALOG = 0x39, TITLE_AMIIBO_BUTTON = 0x6c;
-const uint64_t DIALOG_ANSWER = 0x7001c4b308;  // the dialog's answer (FUN_7100d46068 takes it)
+const uint64_t DIALOG_ANSWER = 0x7001dac9a8;  // the dialog's answer (FUN_7100e59418 takes it)
 const uint32_t DIALOG_NO_ANSWER = 0xd;
 const int GAME_ENTRIES = 14;
 // the game's entries (game data flag names): 1 CameraUpDownReverse, 2 CameraRLReverse, 7 StickSensitivity,
@@ -438,8 +438,8 @@ int clamp_value(const Item &it, int x) {
 
 void mark_all_rows(uint64_t screen) {
     if (!screen) return;
-    int n = (int)rd32(screen + 0x3698);
-    uint64_t rows = rd64(screen + 0x36a0);
+    int n = (int)rd32(screen + 0x36b0);
+    uint64_t rows = rd64(screen + 0x36b8);
     for (int i = 0; i < n && i < 64 && rows; i++)
         if (uint64_t r = rd64(rows + 8 * i)) g_dirty.push_back(r);
 }
@@ -680,7 +680,7 @@ extern "C" void rt_opt_back(void) {
 // The quit question's answer is read here too.
 extern "C" int rt_opt_title_tick(uint64_t menu) {
     quit_poll();
-    if (rd32(menu + 0x363c) != MENU_OPTIONS_ACTIVE) {  // (the Options button isn't active: next opening, first page)
+    if (rd32(menu + 0x3654) != MENU_OPTIONS_ACTIVE) {  // (the Options button isn't active: next opening, first page)
         g_reopen = g_switching = false;
         return 0;
     }
@@ -700,7 +700,7 @@ extern "C" int rt_opt_pause_tick(void) {
 extern "C" uint64_t rt_opt_screen(void) { return options_screen(); }
 
 // ---- Quit: the game's two-button dialog (screen 0x39, type 7) asks: desktop (upper button) or the start screen
-// (lower). Its buttons write their answer to 0x7001c4b308 (upper 0x5b: 0, lower 0x5a: 1; FUN_7100d46598) and leave
+// (lower). Its buttons write their answer to 0x7001dac9a8 (upper 0x5b: 0, lower 0x5a: 1; FUN_7100e59948) and leave
 // the dialog up; B closes it without an answer (rt_quit_dialog_back).
 
 // The title menu's amiibo settings button (Savage Wind has no amiibo support) is Quit

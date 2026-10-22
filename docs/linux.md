@@ -37,6 +37,10 @@ Ubuntu / Debian packages (other distributions: the same libraries under their na
     sudo apt install clang lld make pkg-config python3-venv libsdl3-dev libavformat-dev libavcodec-dev \
         libavutil-dev libswscale-dev libvulkan-dev libshaderc-dev libvulkan-memory-allocator-dev glslc vulkan-tools
 
+Arch: `clang lld make python sdl3 ffmpeg vulkan-headers shaderc` from the repositories and `vulkan-memory-allocator`
+from the AUR (a header only; or put `vk_mem_alloc.h` under `$DEPS/include` and pass `DEPS=<dir>`), and `make` takes
+`SHADERC=-lshaderc_shared` (the library's name there).
+
 Then from the repo root:
 
     python3 -m venv tools/venv && tools/venv/bin/pip install lz4 capstone unicorn

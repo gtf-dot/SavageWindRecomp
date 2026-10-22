@@ -368,11 +368,11 @@ static void rom_index(int fd) {
     LOG("[fs] romfs index: %d files\n", rom_nfiles);
 }
 
-// The title screen's version line: main 1.8.2 formats System/Version.txt with "Ver.%s" (0x71014b854e in the Ghidra
-// project, read by FUN_7100d4b57c and FUN_7100d4bca0); "%s" leaves just "Savage Wind <version>". Called once main is
+// The title screen's version line: main 1.9.0 formats System/Version.txt with "Ver.%s" (0x71015cd092 in the Ghidra
+// project, read by FUN_7100e5e94c and FUN_7100e5f070); "%s" leaves just "Savage Wind <version>". Called once main is
 // loaded; anything else at that address is left alone.
 void fs_title_version_patch(void) {
-    char *fmt = (char *)(uintptr_t)0x70014b854eull;
+    char *fmt = (char *)(uintptr_t)0x70015cd092ull;
     if (memcmp(fmt, "Ver.%s", 7)) { LOG("[fs] title version: \"Ver.%%s\" not found, left as is\n"); return; }
     memcpy(fmt, "%s", 3);
 }
