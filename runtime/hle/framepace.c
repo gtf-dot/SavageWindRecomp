@@ -49,6 +49,7 @@ extern volatile int g_movie_playing;  // runtime/hle/movie.c: video decoders run
 
 #define VF(T, base, off) (*(T *)(uintptr_t)((base) + (off)))
 #define PAUSE_STATE 0x7001e1611cull  // (u32: 0 playing, 2 in the pause menu or the map)
+#define PLAYER_INFO 0x7001e13ed0ull  // uking::act::PlayerInfo * (the instance pointer; +0x88 Link's position)
 
 static int env_int(const char *name, int def) {
     const char *e = getenv(name);
@@ -108,9 +109,10 @@ int rt_frame_wait(void) { return framepace_on(); }
 // ------------------------------------------------------------------ presents
 // The controllers (sead::ControllerBase::updateDerivativeParams_, 0x7000eb0b4c, through its helper 0x7000eb0ef0) count how long each button has been
 // held, in frames: a held button's repeat starts after its delay and comes every pulse frames, and the game times
-// some holds with the count. The count goes up by a step the game keeps at 1 (a float at 0x7001d6e000, read there
-// only): the runtime sets it to the frame's length in console frames, so holds last as long as on the console.
-#define CONTROLLER_STEP 0x7001d6e000ull
+// some holds with the count. The count goes up by a step the game keeps at 1 (a float at 0x7001dad0e0, which the
+// 1.9.0 code reaches through the pointer slot 0x7001d6e9e0 and reads only there): the runtime sets it to the frame's
+// length in console frames, so holds last as long as on the console.
+#define CONTROLLER_STEP 0x7001dad0e0ull
 static float g_step = 1;         // the last frame's length between presents, in console frames
 static int g_grid_streak;        // presents in a row that kept the pace
 
@@ -210,7 +212,7 @@ void rt_vfr_update(uint64_t vfr) {
     VF(uint8_t, vfr, VFR_CHANGED) = last_iv && iv != last_iv;
     last_iv = iv;
     if (log_every > 0 && nframe++ % (uint64_t)log_every == 0) {
-        uint64_t pinfo = *(uint64_t *)(uintptr_t)0x7001d6af80ull;  // (Link's position: PlayerInfo +0x88)
+        uint64_t pinfo = *(uint64_t *)(uintptr_t)PLAYER_INFO;  // (Link's position: PlayerInfo +0x88)
         LOG("[framepace] target %d fps, %.2f ms since the last update (avg %.2f), ratio %.3f, interval %u, owed "
             "%.2f ms, Link %.3f %.3f%s\n", framepace_target(), s * 1e3, smooth * 1e3, ratio, iv, (real - given) * 1e3,
             pinfo ? VF(float, pinfo, 0x88) : 0.0f, pinfo ? VF(float, pinfo, 0x90) : 0.0f,
@@ -252,7 +254,7 @@ uint64_t framepace_script_frame(uint64_t presented) {
 // seconds since the probe started, frames, the game's own time (its delta frames summed, 1/30 s each, slow motion
 // included), the time of day (TimeMgr, 0..360 = 24 h: one in-game minute is 0.25), Link's position and stamina
 // (1000 a wheel). 1.9.0 addresses: ksys::world::Manager [0x7001e57580] (+0x5c0 count, +0x5c8 its managers; [0] =
-// TimeMgr, the time at +0xb8); uking::act::PlayerInfo [0x7001d6af80] (a GOT entry: the static instance; +0x88 Link's position, +0xa4 the stamina).
+// TimeMgr, the time at +0xb8); uking::act::PlayerInfo [0x7001e13ed0] (+0x88 Link's position, +0xa4 the stamina).
 static void clock_probe(uint64_t vfr) {
     static int every = -1;
     static uint64_t t0, next, frames;
@@ -272,7 +274,7 @@ static void clock_probe(uint64_t vfr) {
         uint64_t mgrs = VF(uint64_t, wm, 0x5c8), tm = mgrs ? *(uint64_t *)(uintptr_t)mgrs : 0;
         if (tm) tod = VF(float, tm, 0xb8);
     }
-    uint64_t pinfo = *(uint64_t *)(uintptr_t)0x7001d6af80ull;
+    uint64_t pinfo = *(uint64_t *)(uintptr_t)PLAYER_INFO;
     if (pinfo) {
         for (int i = 0; i < 3; i++) pos[i] = VF(float, pinfo, 0x88 + 4 * i);
         stamina = VF(float, pinfo, 0xa4);

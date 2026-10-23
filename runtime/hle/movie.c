@@ -1,9 +1,10 @@
 // movie:: (nnMedia) implemented with FFmpeg: an Android MediaExtractor/MediaCodec-style API.
 // The game owns the objects (vtable at +0); we keep host state at +8.
 //
-// Extractor slots: 4 GetTrackCount(int*), 5 GetTrackConfiguration(int, MediaData*), 6 SelectTrack(int),
+// Extractor slots: 2 SetDataSource(const char* path) (the game's player opens its movies with this one),
+//   4 GetTrackCount(int*), 5 GetTrackConfiguration(int, MediaData*), 6 SelectTrack(int),
 //   9 GetSampleTrackIndex(size_t*), 10 Read(Buffer*), 11 Advance(), 12 GetSampleTime(int64*),
-//   15 SetDataSource(DataSource*, const char* path).
+//   15 SetDataSource(DataSource*, const char* path) (an older SDK's overload, kept).
 // Decoder slots: 2 Configure(MediaData*), 3 RegisterClientEvents(EventType*[4]), 4 GetOutputFormat(MediaData*),
 //   6 Start, 9 AcquireInputBufferIndex(int*, int*), 10 GetInputBuffer(int, Buffer*),
 //   11 SendInputBufferForDecode(int, int off, int size, int64 time, uint32 flags),
@@ -210,9 +211,9 @@ static void ex_fill(Extractor *e) {
     }
 }
 
-static void ex_set_data_source(Cpu *c) {
+// Open the movie at a guest path (both SetDataSource overloads end here).
+static void ex_open(Cpu *c, const char *path) {
     Extractor *e = self_state(c);
-    const char *path = (const char *)(uintptr_t)c->x[2];
     // "rom:/region_common/movie/title.webm" -> extracted/romfs/region_common/movie/title.webm
     const char *rel = path && strstr(path, ":/") ? strstr(path, ":/") + 2 : path;
     char host[1024];
@@ -235,6 +236,14 @@ static void ex_set_data_source(Cpu *c) {
             e->map[e->ntracks++] = (int)i;
     c->x[0] = 0;
 }
+
+// slot 2: SetDataSource(const char* path). BOTW 1.9.0's player (0x70013fd750) opens every movie through this slot;
+// an unimplemented slot there returned success without opening anything, the track count came back 0, the player
+// gave up before creating its frame queue and the next command dereferenced the null queue (signal 11 at 0x189 at
+// the first tower's video).
+static void ex_set_data_source_path(Cpu *c) { ex_open(c, (const char *)(uintptr_t)c->x[1]); }
+// slot 15: SetDataSource(DataSource*, const char* path)
+static void ex_set_data_source(Cpu *c) { ex_open(c, (const char *)(uintptr_t)c->x[2]); }
 
 static void ex_get_track_count(Cpu *c) {
     Extractor *e = self_state(c);
@@ -370,11 +379,12 @@ EX_LOCKED(ex_advance)
 EX_LOCKED(ex_get_sample_time)
 EX_LOCKED(ex_cached_duration)
 EX_LOCKED(ex_set_data_source)
+EX_LOCKED(ex_set_data_source_path)
 
 HLE_FUNC("_ZN5movie9ExtractorC1ENS_13ContainerTypeE", movie_extractor_ctor) {
     uint64_t vt = g_ex_vt;
     if (!vt) {
-        HostFn f[16] = {ex_dtor_l, ex_dtor_l, movie_log_slot, movie_log_slot, ex_get_track_count_l,
+        HostFn f[16] = {ex_dtor_l, ex_dtor_l, ex_set_data_source_path_l, movie_log_slot, ex_get_track_count_l,
                         ex_get_track_config_l, ex_select_track_l, movie_log_slot, ex_seek_l, ex_get_sample_track_l,
                         ex_read_l, ex_advance_l, ex_get_sample_time_l, movie_log_slot, ex_cached_duration_l,
                         ex_set_data_source_l};
@@ -724,6 +734,36 @@ static void dec_get_output_buffer(Cpu *c) {
         int dst_stride[1] = {w * 4};
         sws_scale(d->sws, src, src_stride, 0, h, dst, dst_stride);
         renderer_upload_rgba(t, d->rgba, (uint32_t)w, (uint32_t)h, (uint32_t)w * 4);
+        c->x[0] = 0;
+        return;
+    }
+    if (b->base && b->capacity > 8) {
+        // BOTW 1.9.0 (SDK 21): the player hands in the destination, a CPU mapping of the memory pool behind its
+        // two textures (movie::Buffer::SetDataAndCapacity before GetOutputBuffer, 0x70013fec20), and shows those
+        // textures. It lays the pool out itself (0x70013fe7c4): Y as width x height bytes, then the interleaved UV
+        // plane, width x height/2, both at a stride of exactly width; it reads no stride or offset key from
+        // GetOutputFormat. The decoded picture is repacked into that layout (handing back a buffer of ours left the
+        // textures unwritten: green with noise).
+        uint8_t *dst = (uint8_t *)(uintptr_t)b->base;
+        uint32_t n = 0;
+        if (d->video && d->out_size[i]) {
+            uint32_t w = (uint32_t)d->width, h = (uint32_t)d->height, need = w * h + w * (h / 2);
+            if (need > b->capacity) {
+                static int warned;
+                if (!warned++) LOG("[movie] picture %u bytes > the game's buffer %llu\n", need, (unsigned long long)b->capacity);
+            } else {
+                const uint8_t *src = d->out_mem[i], *uv = src + (uint64_t)d->stride * ((h + 15) & ~15u);
+                for (uint32_t y = 0; y < h; y++) memcpy(dst + (uint64_t)y * w, src + (uint64_t)y * d->stride, w);
+                for (uint32_t y = 0; y < h / 2; y++) memcpy(dst + (uint64_t)w * h + (uint64_t)y * w, uv + (uint64_t)y * d->stride, w);
+                n = need;
+            }
+        } else {
+            n = d->out_size[i];
+            if (n > b->capacity) n = (uint32_t)b->capacity;
+            memcpy(dst, d->out_mem[i], n);
+        }
+        b->offset = 0;
+        b->size = (int32_t)n;
         c->x[0] = 0;
         return;
     }
