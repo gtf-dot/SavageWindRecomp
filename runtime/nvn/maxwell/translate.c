@@ -916,6 +916,40 @@ static void glsl_gather(Ctx *c, char *out, int slot, const char *const *co, cons
     else sprintf(out, "vec4(%s.x, %s.y, %s.z, %s.w)", call[0], call[1], call[2], call[3]);
 }
 
+// MSL gather (glsl_gather's counterpart, same arguments): gather / gather_compare on the slot's texture2d(_array) /
+// texturecube(_array) (depth* for a shadow slot). Offsets move the coordinates as in glsl_gather (by offset x the
+// slot's resolution scale / allocated size; vertex functions have no rscale table: unscaled).
+static void msl_gather(Ctx *c, char *out, int slot, const char *const *co, const char *layer, const char *dref, int comp,
+                       const char *const *off, int noff) {
+    if (c->fail) { strcpy(out, "float4(0.0f)"); return; }
+    const ShaderTexture *t = &c->info->tex[slot];
+    int type = t->type;
+    bool cube = type == TEXTYPE_CUBE || type == TEXTYPE_CUBE_ARRAY;
+    bool arr = type == TEXTYPE_2D_ARRAY || type == TEXTYPE_CUBE_ARRAY;
+    if (type != TEXTYPE_2D && type != TEXTYPE_2D_ARRAY && !cube) {
+        fail(c, "gather on texture type %d", type);
+        strcpy(out, "float4(0.0f)");
+        return;
+    }
+    if (cube && noff) noff = 0;  // (cube lookups take no offset)
+    static const char *const cname[] = {"x", "y", "z", "w"};
+    char P[4][700], call[4][1000], lay[200] = "";
+    if (arr) snprintf(lay, sizeof lay, ", %s", layer ? layer : "0u");
+    int n = noff == 4 ? 4 : 1;
+    for (int i = 0; i < n; i++) {
+        if (cube) snprintf(P[i], sizeof P[i], "float3(%s, %s, %s)", co[0], co[1], co[2]);
+        else if (noff)
+            snprintf(P[i], sizeof P[i], "(float2(%s, %s) + float2(%s)%s / float2(t%d.get_width(0), t%d.get_height(0)))", co[0], co[1],
+                     off[i], c->stage == STAGE_VERTEX ? "" : off_scale(c, slot, 2), slot, slot);
+        else snprintf(P[i], sizeof P[i], "float2(%s, %s)", co[0], co[1]);
+        if (t->shadow) snprintf(call[i], sizeof call[i], "t%d.gather_compare(s%d, %s%s, %s)", slot, slot, P[i], lay, dref ? dref : "0.0f");
+        else snprintf(call[i], sizeof call[i], "t%d.gather(s%d, %s%s%s, component::%s)", slot, slot, P[i], lay, cube ? "" : ", int2(0)",
+                      cname[comp & 3]);
+    }
+    if (n == 1) sprintf(out, "%s", call[0]);
+    else sprintf(out, "float4(%s.x, %s.y, %s.z, %s.w)", call[0], call[1], call[2], call[3]);
+}
+
 // TLD4 / TLD4.B: from Ra the array index (if any) then the coordinates; from Rb the bindless handle, the offsets
 // (AOFFI: one register, 6-bit x and y at bits 0 and 8; PTP: two registers with four x / y pairs, a byte each) and
 // the depth reference (register layout as Ryujinx, MIT, reads it).
@@ -927,7 +961,6 @@ static void emit_tld4(Ctx *c, uint64_t w, uint32_t pc, bool bindless) {
     int toff = bindless ? (int)bits(w, 36, 2) : (int)bits(w, 54, 2);  // 0 none, 1 AOFFI, 2 PTP
     uint32_t mask = (uint32_t)bits(w, 31, 4);
     if (d == RZ) return;
-    if (!c->glsl) { fail(c, "tld4 (msl)"); return; }
     int index = bindless ? bindless_index(c, pc, b) : (int)bits(w, 36, 13);
     if (index < 0 || index >= 8192) { fail(c, "bindless tld4 (handle not from c[2])"); return; }
     if (bindless) b = b == RZ ? RZ : b + 1;
@@ -936,7 +969,12 @@ static void emit_tld4(Ctx *c, uint64_t w, uint32_t pc, bool bindless) {
     char ra[8][16], lay[96], cs[3][40], ofs[4][96], drv[48], call[4096];
     int ri = 0;
     const char *layp = NULL;
-    if (array) { snprintf(lay, sizeof lay, "min(%s, uint(tsize%d(0).z) - 1u)", reg(c, a, ra[ri++]), slot); layp = lay; if (a != RZ) a++; }
+    if (array) {
+        if (c->glsl) snprintf(lay, sizeof lay, "min(%s, uint(tsize%d(0).z) - 1u)", reg(c, a, ra[ri++]), slot);
+        else snprintf(lay, sizeof lay, "min(uint(%s), t%d.get_array_size() - 1u)", reg(c, a, ra[ri++]), slot);
+        layp = lay;
+        if (a != RZ) a++;
+    }
     const char *co[3];
     for (int i = 0; i < ncoord; i++) {
         snprintf(cs[i], sizeof cs[i], "as_type<float>(%s)", reg(c, a, ra[ri++]));
@@ -955,13 +993,15 @@ static void emit_tld4(Ctx *c, uint64_t w, uint32_t pc, bool bindless) {
         for (int i = 0; i < noff; i++) {
             const char *p = pk[(i * 2) >> 2];  // pairs 0, 1 in the first register, 2, 3 in the second
             int sx = ((i * 2) & 3) * 8, sy = ((i * 2 + 1) & 3) * 8;
-            snprintf(ofs[i], sizeof ofs[i], "ivec2(int(%s << %du) >> 26, int(%s << %du) >> 26)", p, 26 - sx, p, 26 - sy);
+            snprintf(ofs[i], sizeof ofs[i], c->glsl ? "ivec2(int(%s << %du) >> 26, int(%s << %du) >> 26)"
+                                                    : "int2(int(%s << %du) >> 26, int(%s << %du) >> 26)", p, 26 - sx, p, 26 - sy);
             offp[i] = ofs[i];
         }
     }
     const char *drp = NULL;
     if (dc) { char rb_[16]; snprintf(drv, sizeof drv, "as_type<float>(%s)", reg(c, b, rb_)); drp = drv; }
-    glsl_gather(c, call, slot, co, layp, drp, comp, offp, noff);
+    if (c->glsl) glsl_gather(c, call, slot, co, layp, drp, comp, offp, noff);
+    else msl_gather(c, call, slot, co, layp, drp, comp, offp, noff);
     write_tex_result(c, slot, call, mask, d, RZ, false, false);
 }
 
@@ -973,7 +1013,6 @@ static void emit_tld4s(Ctx *c, uint64_t w, bool f16) {
     bool dc = bits(w, 50, 1), aoffi = bits(w, 51, 1);
     int comp = (int)bits(w, 52, 2);
     if (d0 == RZ && d1 == RZ) return;
-    if (!c->glsl) { fail(c, "tld4s (msl)"); return; }
     int slot = tex_slot(c, index, TEXTYPE_2D, dc, false);
     char r0[16], r1[16], cs[2][40], ofs[96], drv[48], call[4096];
     if (dc || aoffi) {
@@ -988,12 +1027,14 @@ static void emit_tld4s(Ctx *c, uint64_t w, bool f16) {
     if (aoffi) {
         char pb[16];
         const char *p = reg(c, rb, pb);
-        snprintf(ofs, sizeof ofs, "ivec2(int(%s << 26u) >> 26, int(%s << 18u) >> 26)", p, p);
+        snprintf(ofs, sizeof ofs, c->glsl ? "ivec2(int(%s << 26u) >> 26, int(%s << 18u) >> 26)"
+                                          : "int2(int(%s << 26u) >> 26, int(%s << 18u) >> 26)", p, p);
         if (rb != RZ) rb++;
     }
     const char *drp = NULL;
     if (dc) { char q[16]; snprintf(drv, sizeof drv, "as_type<float>(%s)", reg(c, rb, q)); drp = drv; }
-    glsl_gather(c, call, slot, co, NULL, drp, comp, offp, aoffi ? 1 : 0);
+    if (c->glsl) glsl_gather(c, call, slot, co, NULL, drp, comp, offp, aoffi ? 1 : 0);
+    else msl_gather(c, call, slot, co, NULL, drp, comp, offp, aoffi ? 1 : 0);
     write_tex_result(c, slot, call, d1 == RZ ? 0x3 : 0xf, d0, d1, true, f16);
 }
 
@@ -1005,7 +1046,6 @@ static void emit_tmml(Ctx *c, uint64_t w, uint32_t pc, bool bindless) {
     int dim = (int)bits(w, 28, 3), type = dim_type(dim);
     uint32_t mask = (uint32_t)bits(w, 31, 4);
     if (d == RZ) return;
-    if (!c->glsl) { fail(c, "tmml (msl)"); return; }
     int index = bindless ? bindless_index(c, pc, b) : (int)bits(w, 36, 13);
     if (index < 0 || index >= 8192) { fail(c, "bindless tmml (handle not from c[2])"); return; }
     bool fresh = !c->tex_slot[index];
@@ -1016,13 +1056,21 @@ static void emit_tmml(Ctx *c, uint64_t w, uint32_t pc, bool bindless) {
     if (dim & 1 && a != RZ) a++;  // (the array index is not part of an LOD query)
     char rr[3][16], P[200];
     if (n == 1) snprintf(P, sizeof P, "as_type<float>(%s)", reg(c, a, rr[0]));
-    else if (n == 2) snprintf(P, sizeof P, "vec2(as_type<float>(%s), as_type<float>(%s))", reg(c, a, rr[0]),
+    else if (n == 2) snprintf(P, sizeof P, "%s(as_type<float>(%s), as_type<float>(%s))", c->glsl ? "vec2" : "float2", reg(c, a, rr[0]),
                               reg(c, a == RZ ? RZ : a + 1, rr[1]));
-    else snprintf(P, sizeof P, "vec3(as_type<float>(%s), as_type<float>(%s), as_type<float>(%s))", reg(c, a, rr[0]),
-                  reg(c, a == RZ ? RZ : a + 1, rr[1]), reg(c, a == RZ ? RZ : a + 2, rr[2]));
-    if (c->stage == STAGE_FRAGMENT) sp(&c->body, "    { vec2 lq = textureQueryLod(t%d, %s);\n", slot, P);
-    else sp(&c->body, "    { vec2 lq = vec2(0.0f);\n");
-    sp(&c->body, "      uvec4 q = uvec4(uint(int(lq.y * 256.0f)), uint(int(lq.x * 256.0f)), 0u, 0u);\n");
+    else snprintf(P, sizeof P, "%s(as_type<float>(%s), as_type<float>(%s), as_type<float>(%s))", c->glsl ? "vec3" : "float3",
+                  reg(c, a, rr[0]), reg(c, a == RZ ? RZ : a + 1, rr[1]), reg(c, a == RZ ? RZ : a + 2, rr[2]));
+    if (c->glsl) {
+        if (c->stage == STAGE_FRAGMENT) sp(&c->body, "    { vec2 lq = textureQueryLod(t%d, %s);\n", slot, P);
+        else sp(&c->body, "    { vec2 lq = vec2(0.0f);\n");
+        sp(&c->body, "      uvec4 q = uvec4(uint(int(lq.y * 256.0f)), uint(int(lq.x * 256.0f)), 0u, 0u);\n");
+    } else {  // MSL: textureQueryLod's x (the level accessed) and y (the computed LOD); 1D textures have no levels
+        if (c->stage == STAGE_FRAGMENT && n > 1)
+            sp(&c->body, "    { float2 lq = float2(t%d.calculate_clamped_lod(s%d, %s), t%d.calculate_unclamped_lod(s%d, %s));\n",
+               slot, slot, P, slot, slot, P);
+        else sp(&c->body, "    { float2 lq = float2(0.0f);\n");
+        sp(&c->body, "      uint4 q = uint4(uint(int(lq.y * 256.0f)), uint(int(lq.x * 256.0f)), 0u, 0u);\n");
+    }
     int k = 0;
     for (int i = 0; i < 4; i++)
         if (mask & (1u << i)) {
@@ -1094,7 +1142,8 @@ static void emit_tex(Ctx *c, uint64_t w, uint32_t pc, bool bindless) {
     }
     if (aoffi) {
         c->reg_used[pr] = 1;
-        sprintf(off, ", int2(int(r%d << 28) >> 28, int(r%d << 24) >> 28)", pr, pr);
+        if (target == 2) sprintf(off, ", int3(int(r%d << 28) >> 28, int(r%d << 24) >> 28, int(r%d << 20) >> 28)", pr, pr, pr);
+        else if (target != 3) sprintf(off, ", int2(int(r%d << 28) >> 28, int(r%d << 24) >> 28)", pr, pr);
         pr++;
     }
     if (dc) { c->reg_used[pr] = 1; sprintf(dref, "as_type<float>(r%d)", pr); pr++; }
@@ -1814,7 +1863,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     } else if (OPM(0xef48000000000000ull, 0xfff8000000000000ull) || OPM(0xef58000000000000ull, 0xfff8000000000000ull)) {  // LDS / STS
         // compute shared memory: a word array (byte / short accesses within a word, like LDL / STL). The address is
         // Ra + a signed 24-bit offset; it wraps at the array's size.
-        if (c->stage != STAGE_COMPUTE || !c->glsl) { fail(c, "lds/sts outside a vulkan compute shader"); return; }
+        if (c->stage != STAGE_COMPUTE) { fail(c, "lds/sts outside a vulkan compute shader"); return; }
         bool store = bits(w, 52, 1);
         int size = (int)bits(w, 48, 3);
         int32_t off = (int32_t)sbits(w, 20, 24);
@@ -2688,6 +2737,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         if (c->pred_used[i]) sp(&s, "  bool p%d = false;\n", i);
     if (c->uses_cc) sp(&s, "  uint cc = 0; bool ccz = false, ccs = false;\n");
     if (c->uses_local) sp(&s, "  uint lmem[%d] = {};\n", LMEM_WORDS);
+    if (c->uses_shared) sp(&s, "  threadgroup uint smem[%u];\n", c->smem_words);  // (LDS / STS: compute shared memory)
     if (dbg) sp(&s, maxwell_dbg_pc == 0xffffffffu ? "  float dbgv = 1.0f;\n" : "  float dbgv = -1.0f;\n");
     if (any_branch) {
         sp(&s, "  uint pc = 8u; uint ssy[16]; uint ssy_n = 0; uint pbk[16]; uint pbk_n = 0; uint pcnt[16]; uint pcnt_n = 0;\n");

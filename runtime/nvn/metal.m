@@ -417,7 +417,13 @@ static void upload_texture(NvnTexture *t, TexBackend *b, id<MTLBlitCommandEncode
     if (b->uploaded && !b->dynamic && ((g_frame_counter + ((uintptr_t)b >> 6)) & 7)) return;
     const FormatInfo *fi = t->layout.fmt;
     MtlFormat mf = mtl_format(t->format);
-    uint64_t total = tegra_total_size(&t->layout);
+    // pitch textures (NVN_TEXTURE_FLAGS_LINEAR 0x10 or LINEAR_RENDER_TARGET 0x40): rows at the stride, as the Vulkan
+    // backend. Only 0x10 was read that way: BOTW's height tiles (192x192 R16, 0x40), written by the CPU, were
+    // deswizzled as block-linear, and the terrain drawn from them shot up and down in long vertical curtains.
+    bool linear = nvn_texture_flags_pitch(t->flags);
+    uint64_t total = linear && t->stride && t->target != 2
+                   ? t->stride * (t->layout.height ? t->layout.height : 1) * (t->layout.layers ? t->layout.layers : 1)
+                   : tegra_total_size(&t->layout);
     // CPU-written textures (e.g. font glyph caches) change sparsely, so a strided sample can miss
     // updates. Check at most once per frame; textures seen changing get a full hash every frame,
     // the rest a full hash on a rotating ~16 MB/frame budget plus a cheap sample otherwise.
@@ -451,8 +457,7 @@ static void upload_texture(NvnTexture *t, TexBackend *b, id<MTLBlitCommandEncode
     id<MTLCommandBuffer> own_cb = nil;
     if (!blit) { own_cb = [queue commandBuffer]; blit = [own_cb blitCommandEncoder]; }
     uint32_t layers = t->layout.layers ? t->layout.layers : 1;
-    uint64_t layer_size = tegra_layer_size(&t->layout);
-    bool linear = (t->flags & 0x10) != 0;
+    uint64_t layer_size = linear ? t->stride * (t->layout.height ? t->layout.height : 1) : tegra_layer_size(&t->layout);
     for (uint32_t layer = 0; layer < layers; layer++) {
         for (uint32_t lv = 0; lv < t->layout.levels; lv++) {
             LevelLayout l = tegra_level(&t->layout, lv);
@@ -461,7 +466,7 @@ static void upload_texture(NvnTexture *t, TexBackend *b, id<MTLBlitCommandEncode
             uint8_t *lin = malloc(sz);
             const uint8_t *src = (const uint8_t *)(uintptr_t)t->addr + layer * layer_size + l.offset;
             if (linear) {
-                for (uint32_t y = 0; y < l.hb; y++) memcpy(lin + (uint64_t)y * row, src + y * t->stride, row);
+                for (uint32_t y = 0; y < l.hb; y++) memcpy(lin + (uint64_t)y * row, src + (uint64_t)y * (t->stride ? t->stride : row), row);
             } else {
                 tegra_deswizzle(src, lin, l.wb, l.hb, l.d, fi->bpb, l.block_height_log2, l.block_depth_log2);
             }
@@ -511,6 +516,16 @@ id<MTLTexture> renderer_texture(NvnTexture *t, id<MTLBlitCommandEncoder> blit, b
 }
 
 void renderer_mark_gpu_owned(NvnTexture *t) { tex_backend(t)->gpu_owned = true; }
+
+// (renderer.h) Allocated at the output scale; from now on (a target used with scaled ones: made again at the scale).
+bool renderer_texture_scalable(NvnTexture *t) { return tex_backend(t)->scalable; }
+void renderer_make_scalable(NvnTexture *t) {
+    TexBackend *b = tex_backend(t);
+    if (b->scalable || (t->target != 1 && t->target != 4) || t->samples > 1) return;
+    b->scalable = true;
+    release_backend_texture(t, b);
+    create_backend_texture(t, b);
+}
 bool renderer_is_gpu_owned(NvnTexture *t) { return tex_backend(t)->gpu_owned; }
 
 void backend_pool_written(uint64_t addr, uint64_t size) { (void)addr; (void)size; }

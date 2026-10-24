@@ -414,15 +414,34 @@ static id<MTLTexture> view_texture(NvnTexture *t, const NvnTextureView *v, bool 
 // ------------------------------------------------------------------ render passes
 static __unsafe_unretained id last_bias_enc;  // encoder the depth bias was last set on
 
+static uint8_t g_pass_drop;  // (repeated attachments: rt_drop_mask)
+static uint8_t rt_drop_mask(void);
 static void begin_pass(void) {
-    if (enc && !st.rt_dirty) return;
+    uint8_t drop = rt_drop_mask();
+    if (enc && !st.rt_dirty && drop == g_pass_drop) return;
     end_pass();
     st.rt_dirty = false;
+    g_pass_drop = drop;
+    {   // one scale for the pass, as the Vulkan backend: attachments the size of a scaled one are scaled too. BOTW's
+        // G-buffer and lighting passes mix targets the scaling rule takes (depth) and ones it does not (R16 / 2D array
+        // colors): a Metal pass draws only where all its attachments are, so the scene filled the window's top-left
+        // 1 / scale and the rest stayed black.
+        NvnTexture *all[9];
+        int n = 0;
+        for (int i = 0; i < st.rt.ncolor && i < 8; i++) if (st.rt.color[i]) all[n++] = st.rt.color[i];
+        if (st.rt.depth) all[n++] = st.rt.depth;
+        for (int i = 0; i < n; i++) {
+            if (!renderer_texture_scalable(all[i])) continue;
+            for (int k = 0; k < n; k++)
+                if (all[k]->width == all[i]->width && all[k]->height == all[i]->height) renderer_make_scalable(all[k]);
+            break;
+        }
+    }
     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
     int w = 0, h = 0;
     for (int i = 0; i < st.rt.ncolor; i++) {
         NvnTexture *t = st.rt.color[i];
-        if (!t) continue;
+        if (!t || (drop & (1u << i))) continue;
         renderer_mark_gpu_owned(t);
         id<MTLTexture> tex = view_texture(t, &st.rt.cview[i], st.rt.has_cview[i], true, nil);
         rp.colorAttachments[i].texture = tex;
@@ -531,9 +550,52 @@ static id<MTLLibrary> clear_lib(int index) {
     return libs[index];
 }
 
+// One texture attached at two color slots (BOTW's G-buffer pass: targets 1 = 2 and 3 = 4, the second of each pair masked
+// off; its half-resolution pass the same). The Switch writes each slot's channels to memory. An Apple GPU keeps every
+// attachment in tile memory and stores each one whole at the end of a tile, in an order that varies per tile: the
+// masked-off copy overwrote what the other slot wrote in random tiles (a mosaic of black squares over the lit scene).
+// So a repeated attachment is attached once, at the first of its slots the channel mask writes (g_rt_alias: the slot
+// each one is attached at); the others are left out of the pass and the pipeline. Two slots both written can't be
+// merged here: both stay attached (as before).
+static int8_t g_rt_alias[8];  // (g_pass_drop: the current pass's left-out slots)
+static uint8_t rt_drop_mask(void) {
+    uint8_t drop = 0;
+    int n = st.rt.ncolor < 8 ? st.rt.ncolor : 8;
+    for (int i = 0; i < 8; i++) g_rt_alias[i] = (int8_t)i;
+    static int keep = -1;  // SAVAGEWIND_KEEP_REPEATED_TARGETS=1: attach them all (as before)
+    if (keep < 0) keep = getenv("SAVAGEWIND_KEEP_REPEATED_TARGETS") != NULL;
+    if (keep) return 0;
+    for (int i = 0; i < n; i++) {
+        NvnTexture *t = st.rt.color[i];
+        if (!t || (drop & (1u << i)) || g_rt_alias[i] != i) continue;
+        int members[8], nm = 0;
+        members[nm++] = i;
+        for (int j = i + 1; j < n; j++)
+            if (st.rt.color[j] == t && st.rt.has_cview[j] == st.rt.has_cview[i] &&
+                (!st.rt.has_cview[i] || !memcmp(&st.rt.cview[j], &st.rt.cview[i], sizeof st.rt.cview[i])))
+                members[nm++] = j;
+        if (nm == 1) continue;
+        int writers = 0, keep = -1;
+        for (int k = 0; k < nm; k++)
+            if ((st.channel_mask >> (members[k] * 4)) & 0xF) { writers++; if (keep < 0) keep = members[k]; }
+        if (writers > 1) {
+            static int nlog;
+            if (nlog++ < 4) LOG("[metal] texture %ux%u f%#x attached at %d slots, %d of them written: left as is\n", t->width, t->height,
+                                t->format, nm, writers);
+            continue;
+        }
+        if (keep < 0) keep = members[0];
+        for (int k = 0; k < nm; k++) {
+            g_rt_alias[members[k]] = (int8_t)keep;
+            if (members[k] != keep) drop |= (uint8_t)(1u << members[k]);
+        }
+    }
+    return drop;
+}
+
 static void attachment_formats(MTLRenderPipelineDescriptor *pd) {
     for (int i = 0; i < st.rt.ncolor; i++)
-        if (st.rt.color[i]) pd.colorAttachments[i].pixelFormat = view_texture(st.rt.color[i], &st.rt.cview[i], st.rt.has_cview[i], true, nil).pixelFormat;
+        if (st.rt.color[i] && !(g_pass_drop & (1u << i))) pd.colorAttachments[i].pixelFormat = view_texture(st.rt.color[i], &st.rt.cview[i], st.rt.has_cview[i], true, nil).pixelFormat;
     if (st.rt.depth) {
         MTLPixelFormat pf = renderer_pixel_format(st.rt.depth->format);
         if (renderer_format_is_depth(st.rt.depth->format) && st.rt.depth->format != 0x31) pd.depthAttachmentPixelFormat = pf;
@@ -546,6 +608,7 @@ static void attachment_formats(MTLRenderPipelineDescriptor *pd) {
 static void clear(int index, int kind, const void *color, uint32_t mask, bool depth, float dval, bool stencil,
                   uint32_t sval, uint32_t smask) {
     begin_pass();
+    if (index >= 0 && index < 8 && (g_pass_drop & (1u << index))) index = g_rt_alias[index];  // (repeated attachment)
     if (g_debug_frame) {
         int pw, ph;
         pass_size(&pw, &ph);
@@ -652,7 +715,7 @@ static uint64_t ring_alloc(const void *data, uint64_t size) {
         ring = [dev newBufferWithLength:(size > RING_SIZE ? size : RING_SIZE) options:MTLResourceStorageModeShared];
         aligned = 0;
     }
-    memcpy((uint8_t *)ring.contents + aligned, data, size);
+    if (data) memcpy((uint8_t *)ring.contents + aligned, data, size);  // (NULL: the caller fills it)
     ring_off = aligned + size;
     return aligned;
 }
@@ -679,6 +742,14 @@ static int attr_kind(uint32_t fmt) {
     case 0x04: case 0x09: case 0x0C: case 0x10: case 0x15: case 0x18: case 0x1C: case 0x21: case 0x24:
     case 0x28: case 0x2D: case 0x30:
         return 1;
+    // integer-to-float formats (R8_UI2F 0x51 .. RGBA32_I2F 0x68), as the Vulkan backend: fetched as integers, the
+    // shader converts. Read as floats they were raw bits (BOTW's skinned meshes: Link's vertices flew off in spikes).
+    case 0x51: case 0x53: case 0x55: case 0x57: case 0x59: case 0x5B: case 0x5D: case 0x5F: case 0x61: case 0x63:
+    case 0x65: case 0x67:
+        return 4;
+    case 0x52: case 0x54: case 0x56: case 0x58: case 0x5A: case 0x5C: case 0x5E: case 0x60: case 0x62: case 0x64:
+    case 0x66: case 0x68:
+        return 3;
     default: return 0;
     }
 }
@@ -737,10 +808,36 @@ static MTLVertexFormat vertex_format(uint32_t f) {
     case 0x69: return MTLVertexFormatInt1010102Normalized;
     case 0x3F: return MTLVertexFormatFloatRG11B10;
     case 0x40: return MTLVertexFormatFloatRGB9E5;
-    // integer-to-float ("I2F") formats: converted to float by the vertex fetch
-    case 0x51: return MTLVertexFormatUChar;   // these read as raw integers converted in shader
-    default:
+    // integer-to-float: the integer format (attr_kind 3 / 4 makes the shader convert)
+    case 0x51: return MTLVertexFormatUChar;
+    case 0x52: return MTLVertexFormatChar;
+    case 0x53: return MTLVertexFormatUShort;
+    case 0x54: return MTLVertexFormatShort;
+    case 0x55: return MTLVertexFormatUInt;
+    case 0x56: return MTLVertexFormatInt;
+    case 0x57: return MTLVertexFormatUChar2;
+    case 0x58: return MTLVertexFormatChar2;
+    case 0x59: return MTLVertexFormatUShort2;
+    case 0x5A: return MTLVertexFormatShort2;
+    case 0x5B: return MTLVertexFormatUInt2;
+    case 0x5C: return MTLVertexFormatInt2;
+    case 0x5D: return MTLVertexFormatUChar3;
+    case 0x5E: return MTLVertexFormatChar3;
+    case 0x5F: return MTLVertexFormatUShort3;
+    case 0x60: return MTLVertexFormatShort3;
+    case 0x61: return MTLVertexFormatUInt3;
+    case 0x62: return MTLVertexFormatInt3;
+    case 0x63: return MTLVertexFormatUChar4;
+    case 0x64: return MTLVertexFormatChar4;
+    case 0x65: return MTLVertexFormatUShort4;
+    case 0x66: return MTLVertexFormatShort4;
+    case 0x67: return MTLVertexFormatUInt4;
+    case 0x68: return MTLVertexFormatInt4;
+    default: {
+        static uint8_t told[256];
+        if (f != 0x2E && !told[f & 0xFF]++) LOG("[metal] vertex format %#x unknown: read as RGBA32F\n", f);
         return MTLVertexFormatFloat4;
+    }
     }
 }
 
@@ -1083,10 +1180,19 @@ static id<MTLTexture> sampled_texture(NvnTexture *t, const NvnTextureView *v, bo
         id<MTLTexture> src = tex;
         if (want == MTLTextureType2D && (tex.textureType == MTLTextureType2DArray || tex.textureType == MTLTextureTypeCube))
             tex = view_cached(src, 0x6000000000000000ull | 1, ^{ return [src newTextureViewWithPixelFormat:src.pixelFormat textureType:MTLTextureType2D levels:NSMakeRange(0, src.mipmapLevelCount) slices:NSMakeRange(0, 1)]; });
+        else if (want == MTLTextureType2DArray && tex.textureType == MTLTextureTypeCube)  // (its 6 faces, as the Vulkan backend)
+            tex = view_cached(src, 0x6000000000000000ull | 5, ^{ return [src newTextureViewWithPixelFormat:src.pixelFormat textureType:MTLTextureType2DArray levels:NSMakeRange(0, src.mipmapLevelCount) slices:NSMakeRange(0, 6)]; });
         else if (want == MTLTextureType2DArray && tex.textureType == MTLTextureType2D)
             tex = view_cached(src, 0x6000000000000000ull | 2, ^{ return [src newTextureViewWithPixelFormat:src.pixelFormat textureType:MTLTextureType2DArray levels:NSMakeRange(0, src.mipmapLevelCount) slices:NSMakeRange(0, 1)]; });
         else if (want == MTLTextureTypeCube && tex.textureType == MTLTextureType2DArray && tex.arrayLength >= 6)
             tex = view_cached(src, 0x6000000000000000ull | 3, ^{ return [src newTextureViewWithPixelFormat:src.pixelFormat textureType:MTLTextureTypeCube levels:NSMakeRange(0, src.mipmapLevelCount) slices:NSMakeRange(0, 6)]; });
+        // a cube read as a cube array of one (BOTW's 64x64 R11G11B10 light probes), as the Vulkan backend: they were
+        // the dummy texture, so nothing lit by them showed (the Shrine of Resurrection's walls were black)
+        else if (want == MTLTextureTypeCubeArray && (tex.textureType == MTLTextureTypeCube || (tex.textureType == MTLTextureType2DArray && tex.arrayLength >= 6)))
+            tex = view_cached(src, 0x6000000000000000ull | 4, ^{
+                NSUInteger n = src.textureType == MTLTextureTypeCube ? 6 : src.arrayLength / 6 * 6;
+                return [src newTextureViewWithPixelFormat:src.pixelFormat textureType:MTLTextureTypeCubeArray levels:NSMakeRange(0, src.mipmapLevelCount) slices:NSMakeRange(0, n)];
+            });
         else {
             static int nlog;
             if (nlog++ < 30) LOG("[tex] type mismatch: want %lu have %lu (%ux%ux%u target %u fmt %#x arr %lu)\n", (unsigned long)want,
@@ -1129,6 +1235,36 @@ static bool is_attachment(NvnTexture *t) {
     return false;
 }
 
+// A draw that samples t while drawing into one level of it, above level 0: a view of the levels below the attached one
+// (no copy; nil when t is attached at level 0 or as depth). BOTW makes the mips of its terrain height array (1024x1024x8
+// R16) by drawing each level of a layer from the one above it, the shader picking layer and level: the snapshot (one
+// slice, one level) gave every layer's mips layer 0's terrain, and the far terrain that samples them rose and fell in
+// long vertical curtains (seen inside the Shrine of Resurrection, through its walls).
+static id<MTLTexture> levels_below_attachment(int stage, ShaderTexture *st_, NvnTexture *t) {
+    int slot = ((int)st_->handle_offset - 0x20) / 8;
+    uint64_t h = (slot >= 0 && slot < 32) ? st.tex[stage][slot] : 0;
+    uint32_t tic = h & 0xFFFFF;
+    if (!h || !st.tpool || tic >= (uint32_t)st.tpool->count || t == st.rt.depth) return nil;
+    NvnTexEntry *e = &((NvnTexEntry *)st.tpool->entries)[tic];
+    if (e->has_view && (e->view.setmask & ~2u)) return nil;  // (only plain arrays, or a layer range of one)
+    uint32_t below = 0;
+    for (int i = 0; i < st.rt.ncolor; i++) {
+        if (st.rt.color[i] != t) continue;
+        uint32_t al = st.rt.has_cview[i] && (st.rt.cview[i].setmask & 1) ? st.rt.cview[i].base_level : 0;
+        if (!al) return nil;
+        if (!below || al < below) below = al;
+    }
+    if (!below) return nil;
+    id<MTLTexture> base = renderer_texture(t, nil, true);
+    if (below > base.mipmapLevelCount) return nil;
+    NSUInteger y0 = e->has_view ? e->view.min_layer : 0, ny = e->has_view && e->view.num_layers ? e->view.num_layers : base.arrayLength - y0;
+    if (y0 + ny > base.arrayLength) return nil;
+    MTLTextureType type = base.textureType;
+    return view_cached(base, 0x7000000000000000ull | (uint64_t)below << 32 | (uint64_t)y0 << 16 | ny, ^{
+        return [base newTextureViewWithPixelFormat:base.pixelFormat textureType:type levels:NSMakeRange(0, below) slices:NSMakeRange(y0, ny)];
+    });
+}
+
 static void resolve_feedback(Prog *pr) {
     nfeedback = 0;
     static int off = -1;
@@ -1142,6 +1278,12 @@ static void resolve_feedback(Prog *pr) {
             bool have = false;
             for (int k = 0; k < nfeedback; k++) have |= feedback_tex[k] == t;
             if (have || nfeedback == 4) continue;
+            id<MTLTexture> below = levels_below_attachment(sg, &infos[sg]->tex[i], t);
+            if (below) {
+                feedback_tex[nfeedback] = t;
+                feedback_copy[nfeedback++] = below;
+                continue;
+            }
             if (!g_snap_copies) g_snap_copies = [NSMutableDictionary new];
             NSMutableDictionary *copies = g_snap_copies;
             NSValue *key = [NSValue valueWithPointer:t];
@@ -1348,6 +1490,7 @@ static CsProg *compute_program(NvnProgram *p) {
     maxwell_gmem_base = HEAP_BASE;
     maxwell_gmem_size = HEAP_MAX;
     ShaderKey k = {0};
+    k.shared_size = ss->control ? *(const uint32_t *)(ss->control + 0x754) : 0;  // (LDS / STS; as the Vulkan backend)
     cp->si = maxwell_translate((const uint8_t *)(uintptr_t)ss->code_addr, ss->const_offset ? ss->const_offset : 0x10000, STAGE_COMPUTE, &k);
     if (!cp->si->msl) { LOG("[compute] translate failed: %s (code %llx)\n", cp->si->error, ss->code_addr); cp->failed = true; return NULL; }
     for (int i = 0; i < 3; i++) {
@@ -1604,6 +1747,7 @@ static uint64_t pipeline_state_hash(Prog *pr) {
     h = hmix(h, &st.nstream, sizeof st.nstream);
     h = hmix(h, st.stream, sizeof st.stream[0] * (size_t)(st.nstream < 16 ? st.nstream : 16));
     h = hmix(h, &st.channel_mask, sizeof st.channel_mask);
+    h = hmix(h, &g_pass_drop, sizeof g_pass_drop);
     h = hmix(h, &st.color_state[0], sizeof st.color_state[0]);
     h = hmix(h, &st.ms[0xC], 1);
     return h ? h : 1;
@@ -1721,7 +1865,7 @@ static void draw(CmdRec *r, bool indexed) {
     }
     pd.vertexDescriptor = vd;
     for (int i = 0; i < st.rt.ncolor && i < 8; i++) {
-        if (!st.rt.color[i]) continue;
+        if (!st.rt.color[i] || (g_pass_drop & (1u << i))) continue;
         MTLRenderPipelineColorAttachmentDescriptor *ca = pd.colorAttachments[i];
         uint32_t m = (st.channel_mask >> (i * 4)) & 0xF;
         ca.writeMask = (m & 1 ? MTLColorWriteMaskRed : 0) | (m & 2 ? MTLColorWriteMaskGreen : 0) |
@@ -1953,7 +2097,22 @@ static void draw(CmdRec *r, bool indexed) {
     for (int s = 0; s < 12; s++) {
         if (!(used_streams & (1u << s))) continue;
         Range v = st.vbuf[s];
-        if (v.addr) bind_guest(enc, true, v.addr, v.size ? v.size : 16, 18 + s);
+        uint32_t stride = s < st.nstream ? st.stream[s][0] : 0;
+        if (v.addr && v.size && (stride & 3)) {
+            // Metal strides are multiples of 4 (the layout rounds them up): the stream is copied out at that stride.
+            // BOTW's rigidly skinned meshes (Link's head, hair, accessories) keep a one-byte bone index per vertex at
+            // stride 1: read 4 bytes apart, each vertex took another's bone and the triangles flew off in spikes.
+            uint32_t pstride = (stride + 3) & ~3u;
+            uint64_t n = (v.size + stride - 1) / stride;
+            uint64_t off = ring_alloc(NULL, n * pstride);
+            uint8_t *dst = (uint8_t *)ring.contents + off;
+            const uint8_t *src = (const uint8_t *)(uintptr_t)v.addr;
+            for (uint64_t i = 0; i < n; i++) {
+                uint64_t at = i * stride, len = v.size - at < stride ? v.size - at : stride;
+                memcpy(dst + i * pstride, src + at, len);
+            }
+            [enc setVertexBuffer:ring offset:off atIndex:18 + s];
+        } else if (v.addr) bind_guest(enc, true, v.addr, v.size ? v.size : 16, 18 + s);
         else { static const float zero[4]; [enc setVertexBytes:zero length:16 atIndex:18 + s]; }
     }
     if (used_streams & (1u << 31)) { static const float zero[4] = {0, 0, 0, 1}; [enc setVertexBytes:zero length:16 atIndex:30]; }
@@ -1999,9 +2158,13 @@ static void draw(CmdRec *r, bool indexed) {
         } else {
             uint32_t n;
             id<MTLBuffer> ib;
-            if (native) {  // 8-bit indices: widen
+            if (native) {  // 8-bit indices: widen (the restart index 0xFF to Metal's, as the Vulkan backend: kept as vertex
+                           // 255, the strips it separates were joined by stray triangles)
                 uint32_t *w = malloc(count * 4 + 4);
-                for (uint32_t i = 0; i < count; i++) w[i] = ((const uint8_t *)(uintptr_t)iaddr)[i];
+                for (uint32_t i = 0; i < count; i++) {
+                    uint8_t x = ((const uint8_t *)(uintptr_t)iaddr)[i];
+                    w[i] = x == 0xFF && st.prim_restart ? 0xFFFFFFFFu : x;
+                }
                 ib = [dev newBufferWithBytes:w length:count * 4 + 4 options:MTLResourceStorageModeShared];
                 free(w);
                 n = count;
@@ -2361,6 +2524,14 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_BIND_TEXTURES:
             for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 32 && r->x[0] < 6; i++)
                 memcpy(&st.tex[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 8, 8);
+            break;
+        // (stage, first, count, handles): the handles as they are now, as the Vulkan backend. BOTW binds its deferred
+        // lighting composites' inputs this way (normals, albedo, linear depth, probe, light buffers): unexecuted,
+        // everything not emissive was black (the Shrine of Resurrection showed only its glowing lines).
+        case CMD_BIND_TEXTURES_DEFERRED:
+            if (r->x[3] >= GUEST_LO && r->x[3] + r->x[2] * 8 <= GUEST_HI)
+                for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 32 && r->x[0] < 6; i++)
+                    memcpy(&st.tex[r->x[0]][r->x[1] + i], (const uint8_t *)(uintptr_t)r->x[3] + i * 8, 8);
             break;
         case CMD_BIND_IMAGES:
             for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 8 && r->x[0] < 6; i++)
