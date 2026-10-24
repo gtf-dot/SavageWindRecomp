@@ -155,10 +155,129 @@ static uint32_t tex_wh[2][64][2];       // per bound texture slot: guest size
 #define RSCALE_BUFFER_INDEX 18
 
 static int debug_pass_no;
+// ---- linear render targets (as the Vulkan backend's readback_schedule / linear_target_sync). BOTW's 192x192 R16
+// height tiles are linear render targets (flag 0x40) that the GPU draws, its collision code reads from guest memory,
+// and the CPU fills again at the same memory as terrain streams in. So after a pass draws into one, the texels go
+// back to guest memory (a blit into the heap's buffer, landing when the command buffer completes), and before a pass
+// draws into one whose memory the CPU changed since (or that is a texture the memory did not fill yet) the texture
+// takes the memory's texels. Without either, Link stood above or in the terrain drawn, and tiles kept the heights of
+// whatever was there before (ghost boxes over the Great Plateau; the Metal image at a memory is shared, so a tile
+// made again there never took its new contents).
+typedef struct { uint64_t addr, size, hash; void *tex, *pending; } LinearMem;  // pending: the command buffer copying back (retained)
+#define LINEAR_MEM 1024  // (the Vulkan backend keeps 64; here an untracked tile would keep the shared image's old texels)
+static LinearMem linear_mem[LINEAR_MEM];
+static int nlinear_mem;
+static NvnTexture *pass_linear[8];
+static int pass_nlinear;
+extern void renderer_texture_reload(NvnTexture *t);
+extern uint64_t renderer_hash_bytes(const void *p, uint64_t n);
+static uint64_t renderer_pixel_format_bytes(MTLPixelFormat pf, uint64_t nvn_bpb);
+static void wait_cb(id<MTLCommandBuffer> c);
+void renderer_submit(void);
+
+static bool linear_target_ok(NvnTexture *t, const NvnTextureView *v, bool has_view, uint64_t *stride_out, uint64_t *row_out) {
+    static int off = -1;
+    if (off < 0) off = getenv("SAVAGEWIND_NO_LINEAR_READBACK") != NULL;  // (A/B tests)
+    if (off || !(t->flags & 0x40) || t->target != 1 || t->samples > 1 || t->levels > 1 || renderer_format_is_depth(t->format)) return false;
+    if (has_view && ((v->setmask & 1) && v->base_level) ) return false;
+    if (has_view && ((v->setmask & 2) && v->min_layer)) return false;
+    const FormatInfo *fi = nvn_format_info(t->format);
+    if (!fi || !fi->bpb || fi->bpb == 3 || fi->bw != 1 || renderer_texture_scalable(t)) return false;
+    uint64_t row = (uint64_t)t->width * fi->bpb, stride = t->stride ? t->stride : row;
+    if (stride < row || t->addr < g_guest_buffer_base || t->addr + stride * t->height > g_guest_buffer_base + g_guest_buffer.length) return false;
+    *stride_out = stride;
+    *row_out = row;
+    return true;
+}
+
+static int linear_mem_find(uint64_t addr, uint64_t size) {
+    for (int i = 0; i < nlinear_mem; i++) if (linear_mem[i].addr == addr && linear_mem[i].size == size) return i;
+    if (nlinear_mem == LINEAR_MEM) return -1;
+    linear_mem[nlinear_mem] = (LinearMem){addr, size, 0, NULL, NULL};
+    return nlinear_mem++;
+}
+
+// Before a pass draws into linear target t (begin_pass): the texture takes guest memory when the CPU changed it since
+// the last copy back, or when the memory never filled this texture. A copy back still on its way lands first when it
+// is another texture's (the pass about to run reads what it holds); the same texture's: the memory is the GPU's
+// until it lands, nothing to take.
+static void linear_target_begin(NvnTexture *t, const NvnTextureView *v, bool has_view) {
+    uint64_t stride, row;
+    if (!linear_target_ok(t, v, has_view, &stride, &row)) return;
+    uint64_t size = stride * t->height;
+    int n = nlinear_mem, i = linear_mem_find(t->addr, size);
+    if (i < 0) return;
+    LinearMem *m = &linear_mem[i];
+    void *tex = (__bridge void *)renderer_texture(t, nil, true);
+    if (m->pending) {
+        id<MTLCommandBuffer> c = (__bridge id<MTLCommandBuffer>)m->pending;
+        if (c.status < MTLCommandBufferStatusCompleted) {
+            if (m->tex == tex) goto record;
+            if (c == cmdbuf) renderer_submit();
+            wait_cb(c);
+        }
+        CFRelease(m->pending);
+        m->pending = NULL;
+        m->hash = renderer_hash_bytes((const void *)(uintptr_t)t->addr, size);
+    }
+    {
+        uint64_t h = renderer_hash_bytes((const void *)(uintptr_t)t->addr, size);
+        bool reload = i >= n || h != m->hash || m->tex != tex;
+        m->hash = h;
+        m->tex = tex;
+        if (reload) {
+            static int nlog;
+            if (nlog++ < 6) LOG("[linear] target %ux%u f%#x at %llx takes guest memory (%s)\n", t->width, t->height, t->format,
+                                (unsigned long long)t->addr, i >= n ? "first use" : m->tex != tex ? "new texture" : "CPU wrote it");
+            renderer_texture_reload(t);
+        }
+    }
+record:
+    if (pass_nlinear < 8) pass_linear[pass_nlinear++] = t;
+}
+
+// After the pass (end_pass): what it drew into its linear targets goes back to guest memory.
+static void linear_targets_copy_back(void) {
+    for (int k = 0; k < pass_nlinear; k++) {
+        NvnTexture *t = pass_linear[k];
+        uint64_t stride, row;
+        if (!linear_target_ok(t, NULL, false, &stride, &row)) continue;
+        id<MTLTexture> tex = renderer_texture(t, nil, true);
+        const FormatInfo *fi = nvn_format_info(t->format);
+        if (renderer_pixel_format_bytes(tex.pixelFormat, fi->bpb) != fi->bpb || tex.width != t->width || tex.height != t->height) continue;
+        {
+            static uint64_t seen[16];
+            static int nseen;
+            bool known = false;
+            for (int i = 0; i < nseen; i++) known |= seen[i] == t->addr;
+            if (!known && nseen < 16) {
+                seen[nseen++] = t->addr;
+                LOG("[linear] render target %ux%u format %#x stride %llu at %llx: copied back to guest memory\n", t->width, t->height,
+                    t->format, (unsigned long long)stride, (unsigned long long)t->addr);
+            }
+        }
+        id<MTLBlitCommandEncoder> b = [cb() blitCommandEncoder];
+        [b copyFromTexture:tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(t->width, t->height, 1)
+                  toBuffer:g_guest_buffer destinationOffset:t->addr - g_guest_buffer_base destinationBytesPerRow:stride
+     destinationBytesPerImage:stride * t->height];
+        [b endEncoding];
+        int i = linear_mem_find(t->addr, stride * t->height);
+        if (i >= 0) {
+            if (linear_mem[i].pending) CFRelease(linear_mem[i].pending);
+            linear_mem[i].pending = (void *)CFBridgingRetain(cmdbuf);
+            linear_mem[i].tex = (__bridge void *)tex;
+        }
+    }
+    pass_nlinear = 0;
+}
+
+static void bc_shadows_write_back(void);
 static void end_pass(void) {
     if (enc) {
         [enc endEncoding];
         enc = nil;
+        bc_shadows_write_back();
+        linear_targets_copy_back();
         if (g_debug_frame && st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->backend) {
             id<MTLTexture> t = renderer_texture(st.rt.color[0], nil, true);
             id<MTLCommandBuffer> c = cmdbuf;
@@ -381,11 +500,110 @@ static id<MTLTexture> view_cached(id<MTLTexture> base, uint64_t params, id<MTLTe
     return v;
 }
 
+// Bytes per 4x4 block of a BC format, 0 for anything else.
+static NSUInteger mtl_bc_block_bytes(MTLPixelFormat pf) {
+    switch (pf) {
+    case MTLPixelFormatBC1_RGBA: case MTLPixelFormatBC1_RGBA_sRGB: case MTLPixelFormatBC4_RUnorm: case MTLPixelFormatBC4_RSnorm: return 8;
+    case MTLPixelFormatBC2_RGBA: case MTLPixelFormatBC2_RGBA_sRGB: case MTLPixelFormatBC3_RGBA: case MTLPixelFormatBC3_RGBA_sRGB:
+    case MTLPixelFormatBC5_RGUnorm: case MTLPixelFormatBC5_RGSnorm: case MTLPixelFormatBC6H_RGBFloat: case MTLPixelFormatBC6H_RGBUfloat:
+    case MTLPixelFormatBC7_RGBAUnorm: case MTLPixelFormatBC7_RGBAUnorm_sRGB: return 16;
+    default: return 0;
+    }
+}
+static bool mtl_format_compressed(MTLPixelFormat pf) { return pf >= MTLPixelFormatBC1_RGBA && pf <= MTLPixelFormatASTC_12x12_HDR; }
+// Bytes per pixel of the uncompressed formats a view may write BC blocks through, 0 for the rest.
+static NSUInteger mtl_pixel_bytes(MTLPixelFormat pf) {
+    switch (pf) {
+    case MTLPixelFormatR32Uint: case MTLPixelFormatR32Sint: case MTLPixelFormatR32Float: case MTLPixelFormatRG16Uint: case MTLPixelFormatRG16Sint:
+    case MTLPixelFormatRG16Unorm: case MTLPixelFormatRG16Float: case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRGBA8Uint: case MTLPixelFormatRGBA8Sint: return 4;
+    case MTLPixelFormatRG32Uint: case MTLPixelFormatRG32Sint: case MTLPixelFormatRG32Float: case MTLPixelFormatRGBA16Uint: case MTLPixelFormatRGBA16Sint:
+    case MTLPixelFormatRGBA16Unorm: case MTLPixelFormatRGBA16Float: return 8;
+    case MTLPixelFormatRGBA32Uint: case MTLPixelFormatRGBA32Sint: case MTLPixelFormatRGBA32Float: return 16;
+    default: return 0;
+    }
+}
+
+// BC textures written by rendering: BOTW compresses on the GPU, drawing the blocks of a BC texture through a view in
+// an integer format of the block's size (BC4 as RGBA16Uint). Metal has no uncompressed view of a compressed texture
+// (validation aborted), so the pass draws an uncompressed shadow texture a block per pixel, and when the pass ends
+// its bytes go into the BC texture's level by way of a buffer (a copy between the two formats is not allowed either).
+typedef struct { __unsafe_unretained id<MTLTexture> shadow, base; NSUInteger level, slice, plane; } BcShadow;
+static BcShadow bc_pending[16];
+static int bc_npending;
+static id<MTLBuffer> bc_buf;
+
+static id<MTLTexture> bc_shadow(id<MTLTexture> base, MTLPixelFormat pf, NSUInteger lv, NSUInteger layer) {
+    NSUInteger w = MAX(base.width >> lv, 1), h = MAX(base.height >> lv, 1), bw = (w + 3) / 4, bh = (h + 3) / 4;
+    // (a 3D texture's layer is the Z plane it draws: BOTW's 32x32x32 BC4 noise is made this way, a plane at a time)
+    NSUInteger slice = base.textureType == MTLTextureType3D ? 0 : layer, plane = base.textureType == MTLTextureType3D ? layer : 0;
+    if (base.textureType == MTLTextureType3D && plane >= MAX(base.depth >> lv, 1)) plane = MAX(base.depth >> lv, 1) - 1;
+    uint64_t params = 0x8000000000000000ull | (uint64_t)pf | (uint64_t)lv << 24 | (uint64_t)slice << 32 | (uint64_t)plane << 44;
+    id<MTLTexture> sh = view_cached(base, params, ^{
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf width:bw height:bh mipmapped:NO];
+        d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        d.storageMode = MTLStorageModePrivate;
+        id<MTLTexture> t = [dev newTextureWithDescriptor:d];
+        t.label = [NSString stringWithFormat:@"bc shadow of %@ level %lu layer %lu", base.label, (unsigned long)lv, (unsigned long)layer];
+        return t;
+    });
+    if (sh == base) return base;  // (no memory for it)
+    for (int i = 0; i < bc_npending; i++) if (bc_pending[i].shadow == sh) return sh;
+    if (bc_npending < 16) bc_pending[bc_npending++] = (BcShadow){sh, base, lv, slice, plane};
+    return sh;
+}
+
+static void bc_shadows_write_back(void) {
+    if (!bc_npending) return;
+    NSUInteger total = 0, offs[16];
+    for (int i = 0; i < bc_npending; i++) {
+        BcShadow *p = &bc_pending[i];
+        offs[i] = total;
+        total += (p->shadow.width * mtl_bc_block_bytes(p->base.pixelFormat) * p->shadow.height + 255) & ~(NSUInteger)255;
+    }
+    if (!bc_buf || bc_buf.length < total) bc_buf = [dev newBufferWithLength:MAX(total, (NSUInteger)1 << 20) options:MTLResourceStorageModePrivate];
+    id<MTLBlitCommandEncoder> b = [cb() blitCommandEncoder];
+    for (int i = 0; i < bc_npending; i++) {
+        BcShadow *p = &bc_pending[i];
+        NSUInteger row = p->shadow.width * mtl_bc_block_bytes(p->base.pixelFormat), img = row * p->shadow.height;
+        NSUInteger w = MAX(p->base.width >> p->level, 1), h = MAX(p->base.height >> p->level, 1);
+        [b copyFromTexture:p->shadow sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                sourceSize:MTLSizeMake(p->shadow.width, p->shadow.height, 1) toBuffer:bc_buf destinationOffset:offs[i]
+    destinationBytesPerRow:row destinationBytesPerImage:img];
+        [b copyFromBuffer:bc_buf sourceOffset:offs[i] sourceBytesPerRow:row sourceBytesPerImage:img sourceSize:MTLSizeMake(w, h, 1)
+                 toTexture:p->base destinationSlice:p->slice destinationLevel:p->level destinationOrigin:MTLOriginMake(0, 0, p->plane)];
+    }
+    [b endEncoding];
+    static int nlog;
+    if (nlog++ < 8) LOG("[bc] %d BC level(s) written back from render shadows (%s %lux%lu fmt %lu)\n", bc_npending, bc_pending[0].base.label.UTF8String,
+                        (unsigned long)bc_pending[0].base.width, (unsigned long)bc_pending[0].base.height, (unsigned long)bc_pending[0].base.pixelFormat);
+    bc_npending = 0;
+}
+
 static id<MTLTexture> view_texture(NvnTexture *t, const NvnTextureView *v, bool has_view, bool render,
                                    id<MTLBlitCommandEncoder> blit) {
     id<MTLTexture> base = renderer_texture(t, blit, render);
     if (!has_view || !v->setmask) return base;
     MTLPixelFormat pf = (v->setmask & 4) ? renderer_pixel_format(v->format) : base.pixelFormat;
+    if (pf != base.pixelFormat && mtl_format_compressed(pf) != mtl_format_compressed(base.pixelFormat)) {
+        // (a compressed texture through an uncompressed view or the reverse: no such Metal view; see bc_shadow)
+        bool shadow = render && mtl_bc_block_bytes(base.pixelFormat) && mtl_bc_block_bytes(base.pixelFormat) == mtl_pixel_bytes(pf);
+        static int nlog;
+        if (!shadow && nlog++ < 10) LOG("[view] %s fmt %lu viewed as %lu (nvn %#x -> %#x): kept its own format\n", render ? "target" : "texture",
+                                        (unsigned long)base.pixelFormat, (unsigned long)pf, t->format, v->format);
+        if (shadow) {
+            NSUInteger lv = (v->setmask & 1) ? v->base_level : 0, ly = (v->setmask & 2) ? v->min_layer : 0;
+            NSUInteger slices = base.arrayLength * (base.textureType == MTLTextureTypeCube || base.textureType == MTLTextureTypeCubeArray ? 6 : 1);
+            if (lv >= base.mipmapLevelCount) lv = base.mipmapLevelCount - 1;
+            if (base.textureType != MTLTextureType3D && ly >= slices) ly = slices - 1;
+            return bc_shadow(base, pf, lv, ly);
+        }
+        pf = base.pixelFormat;
+    } else if (pf != base.pixelFormat && !mtl_format_compressed(pf) && mtl_pixel_bytes(pf) && mtl_pixel_bytes(base.pixelFormat) &&
+               mtl_pixel_bytes(pf) != mtl_pixel_bytes(base.pixelFormat)) {
+        static int nlog;  // (formats of different sizes: no such view either)
+        if (nlog++ < 10) LOG("[view] fmt %lu viewed as %lu (nvn %#x -> %#x): sizes differ, kept its own format\n", (unsigned long)base.pixelFormat, (unsigned long)pf, t->format, v->format);
+        pf = base.pixelFormat;
+    }
     NSUInteger lv0 = (v->setmask & 1) ? v->base_level : 0;
     NSUInteger nlv = (v->setmask & 1) && v->num_levels ? v->num_levels : base.mipmapLevelCount - lv0;
     NSUInteger ly0 = (v->setmask & 2) ? v->min_layer : 0;
@@ -469,6 +687,7 @@ static void begin_pass(void) {
         NvnTexture *t = st.rt.color[i];
         if (!t || (drop & (1u << i))) continue;
         renderer_mark_gpu_owned(t);
+        linear_target_begin(t, &st.rt.cview[i], st.rt.has_cview[i]);
         id<MTLTexture> tex = view_texture(t, &st.rt.cview[i], st.rt.has_cview[i], true, nil);
         rp.colorAttachments[i].texture = tex;
         rp.colorAttachments[i].depthPlane = render_depth_plane(tex, &st.rt.cview[i], st.rt.has_cview[i]);

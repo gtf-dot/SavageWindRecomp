@@ -637,6 +637,16 @@ id<MTLTexture> renderer_texture(NvnTexture *t, id<MTLBlitCommandEncoder> blit, b
 
 void renderer_mark_gpu_owned(NvnTexture *t) { tex_backend(t)->gpu_owned = true; }
 
+// Guest memory -> texture for every level, whoever owns it (renderer.m: linear render targets the CPU wrote).
+void renderer_texture_reload(NvnTexture *t) {
+    TexBackend *b = tex_backend(t);
+    b->data_hash = 0;
+    b->checked_frame = ~0ull;
+    b->retaken = true;
+    upload_texture(t, b, nil);
+}
+uint64_t renderer_hash_bytes(const void *p, uint64_t n) { return hash_full(p, n); }
+
 // (renderer.h) Allocated at the output scale; from now on (a target used with scaled ones: made again at the scale).
 bool renderer_texture_scalable(NvnTexture *t) { return tex_backend(t)->scalable; }
 void renderer_make_scalable(NvnTexture *t) {
