@@ -530,9 +530,18 @@ static uint64_t fnv_sample(const uint8_t *p, uint64_t n) {
 }
 
 static void upload_levels(NvnTexture *t, TexBackend *b, uint32_t level_mask, id<MTLBlitCommandEncoder> blit);
+
+// Whether the texture's storage is readable guest memory (as the Vulkan backend): a texture made over a virtual pool
+// before the pool was mapped has no address yet, and takes the pool's memory once it has some (BOTW streams its
+// texture memory that way; such textures were never uploaded, and stayed as whatever the shared image held).
+static bool storage_readable(NvnTexture *t, uint64_t total) {
+    if (t->addr < GUEST_LO && t->pool && t->pool->storage) t->addr = t->pool->storage + t->pool_offset;
+    return t->addr >= GUEST_LO && t->addr + total <= GUEST_HI;
+}
+
 // Upload all levels/layers from block-linear guest memory.
 static void upload_texture(NvnTexture *t, TexBackend *b, id<MTLBlitCommandEncoder> blit) {
-    if (!t->addr || t->target == 10) return;
+    if (t->target == 10 || !storage_readable(t, tegra_total_size(&t->layout))) return;
     if (b->uploaded && b->checked_frame == g_frame_counter) return;  // (fast exits before any layout math)
     if (b->uploaded && !b->dynamic && !b->retaken && ((g_frame_counter + ((uintptr_t)b >> 6)) & 7)) return;
     // pitch textures (NVN_TEXTURE_FLAGS_LINEAR 0x10 or LINEAR_RENDER_TARGET 0x40): rows at the stride, as the Vulkan
@@ -577,7 +586,7 @@ static void upload_texture(NvnTexture *t, TexBackend *b, id<MTLBlitCommandEncode
 
 // Guest memory -> the texture's levels in level_mask (every layer), whoever owns the texture.
 static void upload_levels(NvnTexture *t, TexBackend *b, uint32_t level_mask, id<MTLBlitCommandEncoder> blit) {
-    if (!t->addr || t->target == 10) return;
+    if (t->target == 10 || !storage_readable(t, tegra_total_size(&t->layout))) return;
     const FormatInfo *fi = t->layout.fmt;
     MtlFormat mf = mtl_format(t->format);
     bool linear = nvn_texture_flags_pitch(t->flags);
