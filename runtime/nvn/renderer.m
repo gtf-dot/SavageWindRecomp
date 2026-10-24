@@ -3103,7 +3103,15 @@ static void exec_list(uint64_t handle, int depth) {
             static uint32_t seen;
             uint32_t type = (uint32_t)r->x[0];
             if (type < 32 && !(seen & (1u << type))) { seen |= 1u << type; LOG("[nvn] ReportCounter type %u\n", type); }
-            if (out) { out[0] = 0; out[1] = SDL_GetTicksNS(); }
+            // The game times its GPU work with these (two per frame) and scales its quality from that. Timed here they
+            // measured our command translation, not GPU work: every counter of a presented frame gets the same
+            // timestamp (no GPU time), as the Vulkan backend. SAVAGEWIND_COUNTER=live: the time of each counter.
+            static int frozen = -1;
+            if (frozen < 0) { const char *e = getenv("SAVAGEWIND_COUNTER"); frozen = !e || strcmp(e, "live"); }
+            static uint64_t frame_seen = ~0ull, frame_ts;
+            extern uint64_t renderer_present_count(void);
+            if (frozen && renderer_present_count() != frame_seen) { frame_seen = renderer_present_count(); frame_ts = SDL_GetTicksNS(); }
+            if (out) { out[0] = 0; out[1] = frozen ? frame_ts : SDL_GetTicksNS(); }
             break;
         }
         case CMD_COPY_TEXTURE_TO_TEXTURE: {
