@@ -149,7 +149,7 @@ MTLPixelFormat renderer_pixel_format(uint32_t f) { return mtl_format(f).pf; }
 bool renderer_format_alpha_one(uint32_t f) { return mtl_format(f).force_alpha_one; }
 
 // ================================================================== textures
-typedef struct {
+typedef struct TexBackend {
     __unsafe_unretained id<MTLTexture> tex;  // retained manually (CFBridgingRetain)
     bool gpu_owned;     // written by the GPU (render target / copy dest): never re-uploaded
     bool uploaded;
@@ -162,46 +162,96 @@ typedef struct {
     uint32_t level_gen;      // g_level_gen when last used as a render target
     uint64_t frame_cleared;  // SAVAGEWIND_FRAME_CLEAR: frame it was last cleared at first use
     float sx, sy;        // allocation scale relative to the guest's size
-    int reg;             // slot in g_reg (live textures, for the "largest textures" dump) + 1
+    // One image per memory and shape, shared by every texture made there (as vulkan/textures.c)
+    uint64_t key_addr;           // 0: not shared
+    uint32_t key[7];             // target, format, width, height, depth, levels, samples
+    struct TexBackend *key_next;
+    int refs;                    // textures holding the image
+    int all, idle;               // slots + 1 in the lists of all images / images no texture holds
+    uint64_t idle_frame, used_frame;  // when it was let go / last asked for by a finalized texture (zombies)
+    bool retaken;                // taken back from the idle list: its memory may hold a new texture now (full check once)
+    char label[64];              // (the last texture's, for the dump)
 } TexBackend;
 
-// Live textures (diagnostics: the overworld slowdown at 32:9 - the same textures used 870 MB and 4x the GPU time
+// One image per memory and shape. On hardware a texture is its memory: every NVNtexture made over the same memory
+// with the same shape reads and writes the same texels. BOTW makes its ~14 scratch render targets again every frame
+// (and finalizes the previous ones), has pool entries registered with objects it finalized, and copies of NVNtexture
+// objects: they all take the same MTLTexture. Without this every one got a new MTLTexture (about 170 textures and
+// 400 MB every 2 seconds in the Shrine of Resurrection, 40 GB after 4 minutes: the Mac's slowdown). An image no
+// texture holds any more waits PARK_FRAMES for the next texture made there, then goes.
+#define PARK_FRAMES 4
+#define KEY_BUCKETS 4096
+static TexBackend *g_keyed[KEY_BUCKETS];
+static uint32_t key_bucket(uint64_t addr) { return (uint32_t)((addr >> 9) * 0x9E3779B97F4A7C15ull >> 40) & (KEY_BUCKETS - 1); }
+static void key_of(const NvnTexture *t, uint32_t k[7]) {
+    k[0] = t->target; k[1] = t->format; k[2] = t->width; k[3] = t->height; k[4] = t->depth; k[5] = t->levels; k[6] = t->samples;
+}
+static TexBackend *keyed_find(const NvnTexture *t) {
+    uint32_t k[7];
+    key_of(t, k);
+    for (TexBackend *b = g_keyed[key_bucket(t->addr)]; b; b = b->key_next)
+        if (b->key_addr == t->addr && !memcmp(b->key, k, sizeof k)) return b;
+    return NULL;
+}
+static void keyed_add(TexBackend *b, const NvnTexture *t) {
+    b->key_addr = t->addr;
+    uint32_t i = key_bucket(t->addr);
+    b->key_next = g_keyed[i];
+    g_keyed[i] = b;
+}
+static void keyed_remove(TexBackend *b) {
+    if (!b->key_addr) return;
+    for (TexBackend **p = &g_keyed[key_bucket(b->key_addr)]; *p; p = &(*p)->key_next)
+        if (*p == b) { *p = b->key_next; break; }
+    b->key_addr = 0;
+}
+
+// Lists that know each element's slot (index + 1, kept in the element; removal swaps the last one in)
+#define SLOT_LIST(name, T, slot)                                                                                    \
+    static T **g_##name;                                                                                            \
+    static int g_n##name, g_cap_##name;                                                                             \
+    static void name##_add(T *x) {                                                                                  \
+        if (g_n##name == g_cap_##name) {                                                                            \
+            g_cap_##name = g_cap_##name ? g_cap_##name * 2 : 1024;                                                  \
+            g_##name = realloc(g_##name, g_cap_##name * sizeof *g_##name);                                          \
+        }                                                                                                           \
+        g_##name[g_n##name++] = x;                                                                                  \
+        x->slot = g_n##name;                                                                                        \
+    }                                                                                                               \
+    static void name##_remove(T *x) {                                                                               \
+        if (!x->slot) return;                                                                                       \
+        T *last = g_##name[--g_n##name];                                                                            \
+        g_##name[x->slot - 1] = last;                                                                               \
+        last->slot = x->slot;                                                                                       \
+        x->slot = 0;                                                                                                \
+    }
+SLOT_LIST(images, TexBackend, all)           // every image (an in-place reboot destroys them all)
+SLOT_LIST(idle, TexBackend, idle)            // images no texture holds
+SLOT_LIST(holders, NvnTexture, backend_slot) // textures holding an image
+
+// Live images (diagnostics: the overworld slowdown at 32:9 - the same textures used 870 MB and 4x the GPU time
 // until a window resize reallocated them; user 2026-10-09). Dumped when the frame rate stays low.
-static NvnTexture *g_reg[16384];
-static int g_reg_n;
-static void reg_add(NvnTexture *t, TexBackend *b) {
-    if (b->reg || g_reg_n >= 16384) return;
-    g_reg[g_reg_n++] = t;
-    b->reg = g_reg_n;
-}
-static void reg_remove(TexBackend *b) {
-    if (!b->reg) return;
-    int i = b->reg - 1;
-    NvnTexture *last = g_reg[--g_reg_n];
-    g_reg[i] = last;
-    if (last && last->backend) ((TexBackend *)last->backend)->reg = i + 1;
-    b->reg = 0;
-}
 static void dump_largest_textures(const char *why) {
     int idx[16];
     uint64_t sz[16];
     int n = 0;
-    for (int i = 0; i < g_reg_n; i++) {
-        TexBackend *b = g_reg[i] ? (TexBackend *)g_reg[i]->backend : NULL;
-        if (!b || !b->tex) continue;
+    for (int i = 0; i < g_nimages; i++) {
+        TexBackend *b = g_images[i];
+        if (!b->tex) continue;
         uint64_t a = b->tex.allocatedSize;
-        int k = n < 16 ? n++ : 15;
-        if (k == 15 && n == 16 && a <= sz[15]) continue;
+        int k;
+        if (n < 16) k = n++;
+        else if (a <= sz[15]) continue;  // (the 16th slot used to be compared before it was filled: a garbage size)
+        else k = 15;
         while (k > 0 && sz[k - 1] < a) { sz[k] = sz[k - 1]; idx[k] = idx[k - 1]; k--; }
         sz[k] = a; idx[k] = i;
     }
-    LOG("[texdump] %s: %d live textures, largest:\n", why, g_reg_n);
+    LOG("[texdump] %s: %d images (%d textures hold one, %d idle), largest:\n", why, g_nimages, g_nholders, g_nidle);
     for (int k = 0; k < n; k++) {
-        NvnTexture *t = g_reg[idx[k]];
-        TexBackend *b = (TexBackend *)t->backend;
-        LOG("[texdump]   %6.1f MB  guest %ux%u f%#x tgt %u lv %u | mtl %lux%lu lv %lu | scalable %d scale %.2fx%.2f %s\n",
-            sz[k] / 1048576.0, t->width, t->height, t->format, t->target, t->levels, (unsigned long)b->tex.width,
-            (unsigned long)b->tex.height, (unsigned long)b->tex.mipmapLevelCount, b->scalable, b->sx, b->sy, t->label);
+        TexBackend *b = g_images[idx[k]];
+        LOG("[texdump]   %6.1f MB  guest %ux%u f%#x tgt %u lv %u | mtl %lux%lu lv %lu | scalable %d scale %.2fx%.2f refs %d %s\n",
+            sz[k] / 1048576.0, b->key[2], b->key[3], b->key[1], b->key[0], b->key[5], (unsigned long)b->tex.width,
+            (unsigned long)b->tex.height, (unsigned long)b->tex.mipmapLevelCount, b->scalable, b->sx, b->sy, b->refs, b->label);
     }
 }
 
@@ -297,28 +347,99 @@ static MTLTextureType mtl_tex_type(uint32_t target, uint32_t samples) {
 }
 
 static void create_backend_texture(NvnTexture *t, TexBackend *b);
-static void release_backend_texture(NvnTexture *t, TexBackend *b);
+static void release_backend_texture(TexBackend *b);
 int g_tex_live;              // (stats: Metal textures alive and their size)
 uint64_t g_tex_live_bytes;
 void renderer_texture_gone(void *nvn_tex, void *mtl_tex);  // renderer.m
 
+static bool rs_stale(const TexBackend *b) { return b->scalable && (b->sx != g_rs_x || b->sy != g_rs_y); }
+
+static void free_backend(TexBackend *b) {
+    keyed_remove(b);
+    idle_remove(b);
+    images_remove(b);
+    if (b->tex) release_backend_texture(b);
+    free(b);
+}
+
+static void idle_expire(void) {
+    for (int i = g_nidle - 1; i >= 0; i--) {
+        TexBackend *b = g_idle[i];
+        if (total_frames - b->idle_frame > PARK_FRAMES) free_backend(b);
+    }
+}
+
+static void release_backend(NvnTexture *t) {
+    TexBackend *b = t->backend;
+    if (!b) return;
+    holders_remove(t);
+    t->backend = NULL;
+    if (--b->refs > 0) return;
+    if (!b->key_addr || !b->tex) { free_backend(b); return; }
+    b->idle_frame = total_frames;
+    idle_add(b);
+}
+
+// Zombies: finalized textures that still got an image (sampled through an old pool entry or a copy). Nothing will
+// finalize them again, so they let it go once unused for a few frames.
+static NvnTexture **g_zombies;
+static int g_nzombies, g_cap_zombies;
+
+static void zombies_expire(void) {
+    int k = 0;
+    for (int i = 0; i < g_nzombies; i++) {
+        NvnTexture *t = g_zombies[i];
+        TexBackend *b = t->backend;
+        if (!b) continue;
+        if (total_frames - b->used_frame > PARK_FRAMES) release_backend(t);
+        else g_zombies[k++] = t;
+    }
+    g_nzombies = k;
+}
+
 static TexBackend *tex_backend(NvnTexture *t) {
-    if (t->backend) {
-        TexBackend *b = (TexBackend *)t->backend;
-        if (b->scalable && (b->sx != g_rs_x || b->sy != g_rs_y)) {  // output resolution changed: reallocate
-            release_backend_texture(t, b);
+    TexBackend *b = (TexBackend *)t->backend;
+    if (b) {
+        if (t->finalized) b->used_frame = total_frames;
+        if (rs_stale(b)) {  // output resolution changed: reallocate
+            release_backend_texture(b);
             create_backend_texture(t, b);
         }
         return b;
     }
-    TexBackend *b = calloc(1, sizeof *b);
-    b->scalable = tex_scalable(t);
-    if (t->width == 1920 && t->height == 1080 && getenv("SAVAGEWIND_LOG_SCALABLE"))
-        LOG("[scale] 1920x1080 tex %p f%#x flags %#x target %u samples %u levels %u -> scalable %d (%s)\n", (void *)t, t->format,
-            t->flags, t->target, t->samples, t->levels, b->scalable, t->label);
-    create_backend_texture(t, b);
+    static uint64_t expired_at = ~0ull;  // the lists run to thousands in the open world: once a frame is enough
+    if (expired_at != total_frames) {
+        expired_at = total_frames;
+        zombies_expire();
+        idle_expire();
+    }
+    b = t->addr ? keyed_find(t) : NULL;
+    if (b && rs_stale(b)) { release_backend_texture(b); create_backend_texture(t, b); }
+    if (!b) {
+        b = calloc(1, sizeof *b);
+        b->scalable = tex_scalable(t);
+        key_of(t, b->key);
+        if (t->width == 1920 && t->height == 1080 && getenv("SAVAGEWIND_LOG_SCALABLE"))
+            LOG("[scale] 1920x1080 tex %p f%#x flags %#x target %u samples %u levels %u -> scalable %d (%s)\n", (void *)t, t->format,
+                t->flags, t->target, t->samples, t->levels, b->scalable, t->label);
+        create_backend_texture(t, b);
+        images_add(b);
+        if (t->addr) keyed_add(b, t);
+    }
+    if (t->label[0]) strncpy(b->label, t->label, sizeof b->label - 1);
+    if (b->idle) b->retaken = true;
+    idle_remove(b);
+    b->refs++;
     t->backend = b;
-    reg_add(t, b);
+    holders_add(t);
+    if (t->finalized) {
+        b->used_frame = total_frames;
+        if (g_nzombies == g_cap_zombies) {
+            g_cap_zombies = g_cap_zombies ? g_cap_zombies * 2 : 64;
+            g_zombies = realloc(g_zombies, g_cap_zombies * sizeof *g_zombies);
+        }
+        g_zombies[g_nzombies++] = t;
+    }
     return b;
 }
 
@@ -371,19 +492,17 @@ static void create_backend_texture(NvnTexture *t, TexBackend *b) {
     g_tex_live_bytes += tex.allocatedSize;
 }
 
-static void release_backend_texture(NvnTexture *t, TexBackend *b) {  // (also drops the renderer's views of it)
+static void release_backend_texture(TexBackend *b) {  // (also drops the renderer's views of it)
     renderer_texture_gone(NULL, (__bridge void *)b->tex);
     g_tex_live--;
     g_tex_live_bytes -= b->tex.allocatedSize;
     CFBridgingRelease((__bridge CFTypeRef)b->tex);
-    (void)t;
+    b->tex = nil;
 }
 
 void backend_texture_destroyed(NvnTexture *t) {
-    TexBackend *b = t->backend;
     renderer_texture_gone(t, NULL);  // its snapshot copy
-    if (b) { reg_remove(b); release_backend_texture(t, b); free(b); }
-    t->backend = NULL;
+    release_backend(t);
 }
 
 static uint64_t g_frame_counter;  // presents so far (texture change detection runs once per frame)
@@ -414,7 +533,7 @@ static uint64_t fnv_sample(const uint8_t *p, uint64_t n) {
 static void upload_texture(NvnTexture *t, TexBackend *b, id<MTLBlitCommandEncoder> blit) {
     if (!t->addr || t->target == 10) return;
     if (b->uploaded && b->checked_frame == g_frame_counter) return;  // (fast exits before any layout math)
-    if (b->uploaded && !b->dynamic && ((g_frame_counter + ((uintptr_t)b >> 6)) & 7)) return;
+    if (b->uploaded && !b->dynamic && !b->retaken && ((g_frame_counter + ((uintptr_t)b >> 6)) & 7)) return;
     const FormatInfo *fi = t->layout.fmt;
     MtlFormat mf = mtl_format(t->format);
     // pitch textures (NVN_TEXTURE_FLAGS_LINEAR 0x10 or LINEAR_RENDER_TARGET 0x40): rows at the stride, as the Vulkan
@@ -430,7 +549,7 @@ static void upload_texture(NvnTexture *t, TexBackend *b, id<MTLBlitCommandEncode
     if (b->uploaded && b->checked_frame == g_frame_counter) return;
     // Textures that have never changed since upload (almost all: loaded from files) are re-checked every 8th
     // frame, staggered per texture; ones seen changing (glyph caches, video...) every frame.
-    if (b->uploaded && !b->dynamic && ((g_frame_counter + ((uintptr_t)b >> 6)) & 7)) return;
+    if (b->uploaded && !b->dynamic && !b->retaken && ((g_frame_counter + ((uintptr_t)b >> 6)) & 7)) return;
     b->checked_frame = g_frame_counter;
     // linear textures are the CPU-written kind (the font glyph cache, 1024x2048 R8, video): checked in full every
     // frame from the start - a strided sample missed newly rasterized glyphs, so characters of new text popped in
@@ -440,7 +559,8 @@ static void upload_texture(NvnTexture *t, TexBackend *b, id<MTLBlitCommandEncode
     const uint8_t *mem = (const uint8_t *)(uintptr_t)t->addr;
     static int always_full = -1;
     if (always_full < 0) always_full = getenv("SAVAGEWIND_TEX_FULLHASH") ? 1 : 0;
-    bool full = b->dynamic || !b->uploaded || always_full;
+    bool full = b->dynamic || !b->uploaded || b->retaken || always_full;
+    b->retaken = false;
     if (!full && g_frame_counter - b->full_frame >= 120 && full_hash_budget >= total) { full = true; full_hash_budget -= total; }
     if (!full) {
         uint64_t sh = fnv_sample(mem, total);
@@ -523,7 +643,7 @@ void renderer_make_scalable(NvnTexture *t) {
     TexBackend *b = tex_backend(t);
     if (b->scalable || (t->target != 1 && t->target != 4) || t->samples > 1) return;
     b->scalable = true;
-    release_backend_texture(t, b);
+    release_backend_texture(b);
     create_backend_texture(t, b);
 }
 bool renderer_is_gpu_owned(NvnTexture *t) { return tex_backend(t)->gpu_owned; }
@@ -594,12 +714,14 @@ void backend_reset(void) {
     extern void renderer_reset(void);
     extern void renderer_flush(void);
     renderer_flush();  // (everything submitted has completed)
-    int n = g_reg_n;
-    while (g_reg_n > 0) backend_texture_destroyed(g_reg[g_reg_n - 1]);
+    int n = g_nimages;
+    while (g_nholders > 0) backend_texture_destroyed(g_holders[g_nholders - 1]);
+    while (g_nimages > 0) free_backend(g_images[g_nimages - 1]);
+    g_nzombies = 0;
     renderer_reset();
     g_last_presented = NULL;
     g_guest_buffer = nil;
-    LOG("[metal] reboot: %d textures released (%d left alive, %.0f MB)\n", n, g_tex_live, g_tex_live_bytes / 1048576.0);
+    LOG("[metal] reboot: %d images released (%d left alive, %.0f MB)\n", n, g_tex_live, g_tex_live_bytes / 1048576.0);
 }
 
 void backend_heap_set(uint64_t size) { (void)size; }  // (Vulkan on Linux maps GPU memory there)

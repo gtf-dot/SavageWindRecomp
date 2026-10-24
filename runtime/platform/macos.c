@@ -46,9 +46,36 @@ uint64_t plat_now_ns(void) {
     return mach_absolute_time() * tb.numer / tb.denom;
 }
 
+// A wait of more than a couple of milliseconds runs under the time-constraint policy for its duration: macOS coalesces
+// the timers of ordinary threads when the app isn't frontmost (a window behind another, a test run), and a 15 ms wait
+// came back 110-130 ms late. The frame pacer (nvn/objects.c present_pace) sleeps this way once the GPU is ahead of the
+// frame rate, so with the Metal backend at 60 fps the game sat at 7-8 fps as soon as its window lost focus. A thread
+// that already runs real-time (plat_thread_realtime: audio) keeps its policy.
 void plat_sleep_until_ns(uint64_t t) {
     if (!tb.denom) mach_timebase_info(&tb);
-    mach_wait_until(t * tb.denom / tb.numer);
+    uint64_t deadline = t * tb.denom / tb.numer, now = mach_absolute_time();
+    if (deadline <= now) return;
+    uint64_t ns = (deadline - now) * tb.numer / tb.denom;
+    if (ns < 2000000) { mach_wait_until(deadline); return; }
+    thread_port_t th = pthread_mach_thread_np(pthread_self());
+    thread_time_constraint_policy_data_t cur;
+    mach_msg_type_number_t n = THREAD_TIME_CONSTRAINT_POLICY_COUNT;
+    boolean_t get_default = FALSE;
+    bool already = thread_policy_get(th, THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&cur, &n, &get_default) == KERN_SUCCESS &&
+                   !get_default;
+    if (already) { mach_wait_until(deadline); return; }
+    thread_time_constraint_policy_data_t pol = {
+        .period = (uint32_t)(deadline - now),
+        .computation = (uint32_t)(50000 * tb.denom / tb.numer),  // (50 us: it only wakes up)
+        .constraint = (uint32_t)(500000 * tb.denom / tb.numer),
+        .preemptible = 1,
+    };
+    bool rt = thread_policy_set(th, THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&pol, THREAD_TIME_CONSTRAINT_POLICY_COUNT) == KERN_SUCCESS;
+    mach_wait_until(deadline);
+    if (rt) {
+        thread_standard_policy_data_t std = {0};
+        thread_policy_set(th, THREAD_STANDARD_POLICY, (thread_policy_t)&std, THREAD_STANDARD_POLICY_COUNT);
+    }
 }
 
 // Real-time (time-constraint) thread: exempt from the timer coalescing macOS applies to

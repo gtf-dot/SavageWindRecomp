@@ -3,6 +3,7 @@
 #include <dirent.h>
 #include <unistd.h>
 #import <Metal/Metal.h>
+#import <QuartzCore/QuartzCore.h>
 #include <mach/mach_time.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,8 +23,11 @@ static id<MTLRenderPipelineState> clear_pipes[64];
 static NSMutableDictionary<NSString *, id> *cache;
 // (stats) GPU wait time by cause: 0 = guest fence (nvnSyncWait), 1 = full flush (CPU reads GPU results / ring), 2 = sync all
 static uint64_t stat_wait_by[3], stat_wait_n[3];
-static uint64_t stat_draws, stat_skipped, stat_passes, stat_dispatches, stat_wait_ns, stat_flushes, stat_feedback_copies;
+static uint64_t stat_draws, stat_skipped, stat_passes, stat_dispatches, stat_wait_ns, stat_flushes, stat_feedback_copies, stat_feedback_live, stat_feedback_fetch;
+static bool pass_ds_written;         // a draw of the current pass wrote depth or stencil
+static uint8_t pass_color_written;   // the color targets (bits) a draw of the current pass wrote
 static double stat_gpu_s;
+static double stat_cb_wait_s, stat_cb_max_s;  // (stats) commit-to-start wait summed over command buffers; the longest one
 uint64_t g_gpu_total_ns;  // GPU time of all completed command buffers (dynamic resolution: output_scale.c)
 // (forward: texture-lifetime cleanup and stats, defined further down)
 static int g_views_live;
@@ -35,7 +39,7 @@ static uint64_t op_counts[CMD_COUNT];
 bool g_debug_frame;
 void renderer_save_texture(id<MTLTexture> tex, const char *path);
 void renderer_save_texture_alpha(id<MTLTexture> tex, const char *path);
-static char stats_text[320];
+static char stats_text[400];
 
 // ------------------------------------------------------------------ state
 typedef struct {
@@ -97,15 +101,18 @@ const char *renderer_stats(void) {
     struct task_vm_info vmi;
     mach_msg_type_number_t vn = TASK_VM_INFO_COUNT;
     uint64_t foot = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &vn) == KERN_SUCCESS ? vmi.phys_footprint : 0;
-    snprintf(stats_text, sizeof stats_text, "%llu draws, %llu skipped, %llu passes, %llu dispatches, %llu flushes, gpu %.0fms, wait %.0fms, compile %d/%.0fms, fbcopy %llu | tex %d (%.0f MB) views %d snaps %lu mem %.0f MB | waits fence %.0fms/%llu flush %.0fms/%llu all %.0fms/%llu", stat_draws, stat_skipped,
-             stat_passes, stat_dispatches, stat_flushes, stat_gpu_s * 1000.0, (double)stat_wait_ns / 1e6 * 125.0 / 3.0, stat_compiles, stat_compile_ms, stat_feedback_copies,
+    snprintf(stats_text, sizeof stats_text, "%llu draws, %llu skipped, %llu passes, %llu dispatches, %llu flushes, gpu %.0fms (cbwait %.0fms max %.1fms), wait %.0fms, compile %d/%.0fms, fbcopy %llu fblive %llu fbfetch %llu | tex %d (%.0f MB) views %d snaps %lu mem %.0f MB | waits fence %.0fms/%llu flush %.0fms/%llu all %.0fms/%llu", stat_draws, stat_skipped,
+             stat_passes, stat_dispatches, stat_flushes, stat_gpu_s * 1000.0, stat_cb_wait_s * 1000.0, stat_cb_max_s * 1000.0, (double)stat_wait_ns / 1e6 * 125.0 / 3.0, stat_compiles, stat_compile_ms, stat_feedback_copies, stat_feedback_live, stat_feedback_fetch,
              g_tex_live, g_tex_live_bytes / 1048576.0, g_views_live, (unsigned long)(g_snap_copies ? g_snap_copies.count : 0), foot / 1048576.0, stat_wait_by[0] / 24e3, (unsigned long long)stat_wait_n[0], stat_wait_by[1] / 24e3, (unsigned long long)stat_wait_n[1], stat_wait_by[2] / 24e3, (unsigned long long)stat_wait_n[2]);
     stat_compiles = 0;
     stat_feedback_copies = 0;
+    stat_feedback_live = 0;
+    stat_feedback_fetch = 0;
     stat_compile_ms = 0;
     stat_draws = stat_skipped = stat_passes = stat_dispatches = stat_flushes = stat_wait_ns = 0;
     memset(stat_wait_by, 0, sizeof stat_wait_by); memset(stat_wait_n, 0, sizeof stat_wait_n);
     stat_gpu_s = 0;
+    stat_cb_wait_s = stat_cb_max_s = 0;
     return stats_text;
 }
 
@@ -223,8 +230,11 @@ void renderer_submit(void) {
     if (cmdbuf) {
         id<MTLCommandBuffer> c = cmdbuf;
         cmdbuf = nil;
+        double committed = CACurrentMediaTime();  // (same clock as the command buffer's GPU times)
         [c addCompletedHandler:^(id<MTLCommandBuffer> done) {
             stat_gpu_s += done.GPUEndTime - done.GPUStartTime;
+            stat_cb_wait_s += done.GPUStartTime - committed;  // commit -> the GPU starts it (queueing, driver work)
+            if (done.GPUEndTime - done.GPUStartTime > stat_cb_max_s) stat_cb_max_s = done.GPUEndTime - done.GPUStartTime;
             __atomic_add_fetch(&g_gpu_total_ns, (uint64_t)((done.GPUEndTime - done.GPUStartTime) * 1e9), __ATOMIC_RELAXED);
             if (done.error) LOG("[metal] command buffer error: %s\n", done.error.localizedDescription.UTF8String);
         }];
@@ -488,6 +498,8 @@ static void begin_pass(void) {
     if (chunk > 0 && cmdbuf && ++g_passes_in_cb >= chunk) renderer_submit();
     enc = [cb() renderCommandEncoderWithDescriptor:rp];
     vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
+    pass_ds_written = false;
+    pass_color_written = 0;
     stat_passes++;
 }
 
@@ -1001,12 +1013,14 @@ static Prog *get_program(NvnProgram *p, ShaderKey *vkey, ShaderKey *fkey) {
     const uint8_t *vb = (const uint8_t *)vkey;
     for (size_t i = 0; i < sizeof *vkey; i++) { h ^= vb[i]; h *= 0x100000001B3ull; }
     for (int i = 0; i < 8; i++) { h ^= fkey->rt_kind[i]; h *= 0x100000001B3ull; }
+    for (int i = 0; i < 32; i++) { h ^= fkey->fbfetch[i]; h *= 0x100000001B3ull; }
     if (!h) h = 1;
     uint32_t slot = (uint32_t)(h ^ (h >> 31)) & (PROG_TAB - 1);
     while (prog_tab[slot].key && prog_tab[slot].key != h) slot = (slot + 1) & (PROG_TAB - 1);
     if (prog_tab[slot].key) { Prog *fp = (__bridge Prog *)prog_tab[slot].prog; return fp->failed ? nil : fp; }
-    NSString *key = [NSString stringWithFormat:@"%llx/%llx/%@/%@", p->stages[0].code_addr, p->stages[1].code_addr,
-                     [NSData dataWithBytes:vkey length:sizeof *vkey], [NSData dataWithBytes:fkey->rt_kind length:8]];
+    NSString *key = [NSString stringWithFormat:@"%llx/%llx/%@/%@/%@", p->stages[0].code_addr, p->stages[1].code_addr,
+                     [NSData dataWithBytes:vkey length:sizeof *vkey], [NSData dataWithBytes:fkey->rt_kind length:8],
+                     [NSData dataWithBytes:fkey->fbfetch length:sizeof fkey->fbfetch]];
     Prog *pr = cache[key];
     if (pr) {
         prog_tab[slot].key = h;
@@ -1210,6 +1224,9 @@ static id<MTLTexture> sampled_texture(NvnTexture *t, const NvnTextureView *v, bo
 static NvnTexture *feedback_tex[4];
 static id<MTLTexture> feedback_copy[4];
 static int nfeedback;
+static bool feedback_live[4];        // sampled as it is (no copy): the pass loaded it and nothing in the pass wrote it
+static uint8_t fbfetch_map[32];      // (resolve_feedback) fragment texture i reads color attachment fbfetch_map[i] - 1 at
+                                     // its own pixel: a framebuffer fetch variant of the program (ShaderKey fbfetch)
 // Snapshots stay valid until their texture is written again (a draw writing that attachment, a clear, copy or
 // compute). Soft particles (grass-cut leaves, smoke) sample the depth buffer they're tested against but don't
 // write it, so a burst of them shares one snapshot instead of a pass break + full-screen copy per draw.
@@ -1265,8 +1282,29 @@ static id<MTLTexture> levels_below_attachment(int stage, ShaderTexture *st_, Nvn
     });
 }
 
+static bool draw_writes_color(Prog *pr, int i) {
+    return ((pr->fi->out_mask >> (i * 4)) & 0xF) && ((st.channel_mask >> (i * 4)) & 0xF);
+}
+
+// The draw writes neither depth nor stencil: its depth attachment is only read (as the Vulkan backend).
+static bool depth_read_only(void) {
+    if (st.ds[0] && st.ds[1]) return false;
+    if (!st.ds[3]) return true;
+    uint32_t ops = st.ds[5] | st.ds[6] << 8 | st.ds[7] << 16;
+    for (int f = 0; f < 2; f++) {
+        uint32_t o = f ? ops >> 12 : ops;
+        if (!(st.stencil_mask[f] & 0xFF)) continue;
+        for (int k = 0; k < 3; k++) {
+            uint32_t v = (o >> (4 * k)) & 0xF;
+            if (v >= 2 && v <= 8) return false;  // (stencil_op: 2..8 write, KEEP otherwise)
+        }
+    }
+    return true;
+}
+
 static void resolve_feedback(Prog *pr) {
     nfeedback = 0;
+    memset(fbfetch_map, 0, sizeof fbfetch_map);
     static int off = -1;
     if (off < 0) off = getenv("SAVAGEWIND_NO_FEEDBACK") != NULL;
     if (off) return;
@@ -1278,10 +1316,55 @@ static void resolve_feedback(Prog *pr) {
             bool have = false;
             for (int k = 0; k < nfeedback; k++) have |= feedback_tex[k] == t;
             if (have || nfeedback == 4) continue;
+            // An attachment the draw only reads is sampled as it is, as the Vulkan backend does: on this tile-based GPU
+            // the texture in memory holds what the pass loaded, which is current unless a draw of this pass wrote it;
+            // then the pass ends first (its tiles are stored), still without a copy. BOTW's light composites, fog and
+            // particles sample the depth they test against, and its composites keep the G-buffer bound with the channel
+            // masks off and sample it: ~430 full-screen copies and pass breaks a frame in the Shrine of Resurrection.
+            static int nolive = -1;
+            if (nolive < 0) nolive = getenv("SAVAGEWIND_NO_LIVE_FEEDBACK") != NULL;
+            if (!nolive && t == st.rt.depth && depth_read_only()) {
+                if (pass_ds_written) { end_pass(); st.rt_dirty = true; }
+                stat_feedback_live++;
+                feedback_tex[nfeedback] = t;
+                feedback_copy[nfeedback] = nil;
+                feedback_live[nfeedback++] = true;
+                continue;
+            }
+            if (!nolive && t != st.rt.depth) {
+                int ci = -1;
+                for (int k = 0; k < st.rt.ncolor; k++) if (st.rt.color[k] == t) ci = k;
+                if (ci >= 0 && !draw_writes_color(pr, ci)) {
+                    if (pass_color_written & (1u << ci)) { end_pass(); st.rt_dirty = true; }
+                    stat_feedback_live++;
+                    feedback_tex[nfeedback] = t;
+                    feedback_copy[nfeedback] = nil;
+                    feedback_live[nfeedback++] = true;
+                    continue;
+                }
+                // A color target the draw samples where it writes it: BOTW's terrain ORs bits into the G channel of
+                // G-buffer target 0 (fs 50fc37edcd79cf02 reads it at its own pixel), ~200 draws a frame in a row. A copy
+                // of the 1600x900 target before each draw (the pass ended and begun again: every attachment of the
+                // G-buffer stored and loaded) cost most of the frame's GPU time. The Vulkan backend runs these as a
+                // feedback loop with a by-region barrier; here the fragment shader reads the attachment's current value
+                // at its pixel (a framebuffer fetch, [[color(n)]]), which this GPU keeps in tile memory: no copy, no
+                // pass break. The draw takes a variant of its program (ShaderKey fbfetch), made like any other.
+                static int nofetch = -1;
+                if (nofetch < 0) nofetch = getenv("SAVAGEWIND_NO_FBFETCH") != NULL;
+                if (!nofetch && sg == 1 && ci >= 0 && i < 32 && t->samples <= 1 && !(g_pass_drop & (1u << ci))) {
+                    fbfetch_map[i] = (uint8_t)(ci + 1);
+                    stat_feedback_fetch++;
+                    feedback_tex[nfeedback] = t;
+                    feedback_copy[nfeedback] = nil;
+                    feedback_live[nfeedback++] = true;
+                    continue;
+                }
+            }
             id<MTLTexture> below = levels_below_attachment(sg, &infos[sg]->tex[i], t);
             if (below) {
                 feedback_tex[nfeedback] = t;
-                feedback_copy[nfeedback++] = below;
+                feedback_copy[nfeedback] = below;
+                feedback_live[nfeedback++] = false;
                 continue;
             }
             if (!g_snap_copies) g_snap_copies = [NSMutableDictionary new];
@@ -1297,7 +1380,8 @@ static void resolve_feedback(Prog *pr) {
             bool self_write = t == st.rt.depth && st.ds[0] && st.ds[1];
             if (!nosnap && si >= 0 && (snap_ok[si] || self_write) && copies[key]) {  // unchanged since the last snapshot
                 feedback_tex[nfeedback] = t;
-                feedback_copy[nfeedback++] = copies[key];
+                feedback_copy[nfeedback] = copies[key];
+                feedback_live[nfeedback++] = false;
                 continue;
             }
             stat_feedback_copies++;
@@ -1327,7 +1411,8 @@ static void resolve_feedback(Prog *pr) {
              destinationOrigin:MTLOriginMake(0, 0, 0)];
             [b endEncoding];
             feedback_tex[nfeedback] = t;
-            feedback_copy[nfeedback++] = dst;
+            feedback_copy[nfeedback] = dst;
+            feedback_live[nfeedback++] = false;
             if (si < 0) { static int rr; si = rr++ & 7; snap_tex[si] = t; }
             snap_ok[si] = true;
             st.rt_dirty = true;  // the pass resumes (loading) after the copy
@@ -1352,7 +1437,7 @@ static void bind_textures(int stage, ShaderInfo *si) {
                 tex_wh[stage][i][0] = e->tex->width; tex_wh[stage][i][1] = e->tex->height;
             }
             for (int k = 0; k < nfeedback; k++)
-                if (e->tex == feedback_tex[k]) {
+                if (e->tex == feedback_tex[k] && !feedback_live[k]) {
                     id<MTLTexture> fc = feedback_copy[k];
                     MTLTextureType want = mtl_type_for(st_->type);
                     if (fc.textureType != want && want == MTLTextureType2DArray)
@@ -1576,7 +1661,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
             if (e->tex) tex = sampled_texture(e->tex, &e->view, e->has_view, st_->type);
             if (e->tex && i < 64) renderer_texture_scale(e->tex, &tex_sc[0][i][0], &tex_sc[0][i][1]);
             for (int k = 0; k < nfeedback; k++)
-                if (e->tex == feedback_tex[k]) {
+                if (e->tex == feedback_tex[k] && !feedback_live[k]) {
                     id<MTLTexture> fc = feedback_copy[k];
                     MTLTextureType want = mtl_type_for(st_->type);
                     if (fc.textureType != want && want == MTLTextureType2DArray)
@@ -1806,6 +1891,11 @@ static void draw(CmdRec *r, bool indexed) {
                           (int)st.rt.color[0]->height == log_rt_h))
         debug_draw(pr, r, indexed);
     resolve_feedback(pr);
+    if (memcmp(fbfetch_map, fkey.fbfetch, sizeof fbfetch_map)) {  // (fbfetch_map) the framebuffer fetch variant
+        memcpy(fkey.fbfetch, fbfetch_map, sizeof fkey.fbfetch);
+        pr = get_program(st.program, &vkey, &fkey);
+        if (!pr || !pr->ready) { stat_skipped++; return; }
+    }
     // this draw's writes make snapshots of its attachments stale
     snap_reason = "draw-depthwrite";
     if (st.rt.depth && st.ds[0] && st.ds[1]) snapshots_invalidate(st.rt.depth);  // stencil-only writes: shaders sample depth
@@ -1813,6 +1903,9 @@ static void draw(CmdRec *r, bool indexed) {
     for (int i = 0; i < st.rt.ncolor; i++)
         if (st.rt.color[i] && ((st.channel_mask >> (i * 4)) & 0xF)) snapshots_invalidate(st.rt.color[i]);
     begin_pass();
+    if (st.rt.depth && !depth_read_only()) pass_ds_written = true;
+    for (int i = 0; i < st.rt.ncolor; i++)
+        if (st.rt.color[i] && draw_writes_color(pr, i)) pass_color_written |= (uint8_t)(1u << i);
 
     // vertex streams this draw reads (also computed inside the pipeline build on a cache miss)
     uint32_t used_streams = 0;
@@ -2550,8 +2643,10 @@ static void exec_list(uint64_t handle, int depth) {
             }
             const struct { uint64_t tex[8]; NvnTextureView views[8]; uint8_t has_view[8]; uint64_t depth;
                            NvnTextureView dview; uint8_t has_dview; } *rt = x;
+            RtState prev = st.rt;  // the same targets again: keep the pass (as the Vulkan backend; a restart is a
+                                   // full barrier and a reload of every attachment on a TBDR GPU)
             memset(&st.rt, 0, sizeof st.rt);
-            st.rt.ncolor = (int)r->x[0];
+            st.rt.ncolor = (int)r->x[0] > 8 ? 8 : (int)r->x[0];
             for (int i = 0; i < st.rt.ncolor; i++) {
                 st.rt.color[i] = (NvnTexture *)(uintptr_t)rt->tex[i];
                 st.rt.cview[i] = rt->views[i];
@@ -2560,7 +2655,9 @@ static void exec_list(uint64_t handle, int depth) {
             st.rt.depth = (NvnTexture *)(uintptr_t)rt->depth;
             st.rt.dview = rt->dview;
             st.rt.has_dview = rt->has_dview;
-            st.rt_dirty = true;
+            static int always = -1;
+            if (always < 0) always = getenv("SAVAGEWIND_PASS_RESTART") != NULL;
+            if (always || memcmp(&prev, &st.rt, sizeof prev)) st.rt_dirty = true;
             break;
         }
         case CMD_SET_VIEWPORTS:

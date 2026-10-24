@@ -561,8 +561,16 @@ static const char *tex_type_name(int t) {
 
 // Write texture results: component mask selects which of r,g,b,a go to consecutive registers.
 static void write_tex_result(Ctx *c, int slot, const char *call, uint32_t mask, int d0, int d1, bool texs, bool f16) {
+    char fb[40];
+    if (!c->glsl && c->stage == STAGE_FRAGMENT && c->key && slot >= 0 && slot < 32 && c->key->fbfetch[slot]) {
+        // (ShaderKey fbfetch) the texture is the color attachment this draw writes, read at the fragment's own pixel:
+        // the attachment's current value (the renderer checked the draw and target)
+        int rt = c->key->fbfetch[slot] - 1;
+        if (c->key->rt_kind[rt]) snprintf(fb, sizeof fb, "as_type<float4>(fb%d)", rt);
+        else snprintf(fb, sizeof fb, "fb%d", rt);
+        call = fb;
+    }
     sp(&c->body, "    { float4 t = %s;\n", call);
-    (void)slot;
     if (f16) {
         // TEXS/TLDS .F16: components (in mask order) packed as half pairs into d0 (lo, hi) and d1 (lo, hi)
         int comps[4], n = 0;
@@ -2710,8 +2718,18 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         sp(&args, ", constant float4 *ltint [[buffer(19)]]");
         info->uses_tint = true;
     }
+    uint32_t fetched = 0;  // framebuffer fetch inputs declared (one per color attachment)
     for (int i = 0; i < info->ntex; i++) {
         ShaderTexture *t = &info->tex[i];
+        if (stage == STAGE_FRAGMENT && key && i < 32 && key->fbfetch[i]) {  // (write_tex_result: read as fb<rt>)
+            int rt = key->fbfetch[i] - 1;
+            if (!(fetched & (1u << rt))) {
+                fetched |= 1u << rt;
+                int kind = key->rt_kind[rt];
+                sp(&args, ", %s4 fb%d [[color(%d)]]", kind == 1 ? "int" : kind == 2 ? "uint" : "float", rt, rt);
+            }
+            continue;
+        }
         const char *tn = tex_type_name(t->type);
         if (t->shadow) sp(&args, ", depth%s<float> t%d [[texture(%d)]], sampler s%d [[sampler(%d)]]", tn, i, i, i, i);
         else sp(&args, ", texture%s<float> t%d [[texture(%d)]], sampler s%d [[sampler(%d)]]", tn, i, i, i, i);

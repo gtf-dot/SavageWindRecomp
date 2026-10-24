@@ -45,6 +45,8 @@ typedef struct {
     uint32_t vs_out_mask;   // fragment: varyings the vertex shader provides
     uint8_t glsl;           // emit Vulkan GLSL (see the contract above) instead of MSL
     uint32_t shared_size;   // compute: shared memory bytes (from the program's control section)
+    uint8_t fbfetch[32];    // MSL fragment only: texture i is color attachment fbfetch[i] - 1 of the draw, read at its own
+                            // pixel: a framebuffer fetch ([[color(n)]] input) instead of a texture read (0: a texture)
 } ShaderKey;
 
 typedef struct {
