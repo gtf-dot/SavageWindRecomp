@@ -529,13 +529,12 @@ static uint64_t fnv_sample(const uint8_t *p, uint64_t n) {
     return h ^ n;
 }
 
+static void upload_levels(NvnTexture *t, TexBackend *b, uint32_t level_mask, id<MTLBlitCommandEncoder> blit);
 // Upload all levels/layers from block-linear guest memory.
 static void upload_texture(NvnTexture *t, TexBackend *b, id<MTLBlitCommandEncoder> blit) {
     if (!t->addr || t->target == 10) return;
     if (b->uploaded && b->checked_frame == g_frame_counter) return;  // (fast exits before any layout math)
     if (b->uploaded && !b->dynamic && !b->retaken && ((g_frame_counter + ((uintptr_t)b >> 6)) & 7)) return;
-    const FormatInfo *fi = t->layout.fmt;
-    MtlFormat mf = mtl_format(t->format);
     // pitch textures (NVN_TEXTURE_FLAGS_LINEAR 0x10 or LINEAR_RENDER_TARGET 0x40): rows at the stride, as the Vulkan
     // backend. Only 0x10 was read that way: BOTW's height tiles (192x192 R16, 0x40), written by the CPU, were
     // deswizzled as block-linear, and the terrain drawn from them shot up and down in long vertical curtains.
@@ -573,13 +572,23 @@ static void upload_texture(NvnTexture *t, TexBackend *b, id<MTLBlitCommandEncode
     if (b->uploaded && h != b->data_hash) b->dynamic = true;
     b->data_hash = h;
     b->uploaded = true;
+    upload_levels(t, b, ~0u, blit);
+}
+
+// Guest memory -> the texture's levels in level_mask (every layer), whoever owns the texture.
+static void upload_levels(NvnTexture *t, TexBackend *b, uint32_t level_mask, id<MTLBlitCommandEncoder> blit) {
+    if (!t->addr || t->target == 10) return;
+    const FormatInfo *fi = t->layout.fmt;
+    MtlFormat mf = mtl_format(t->format);
+    bool linear = nvn_texture_flags_pitch(t->flags);
     // callers without an encoder get a private upload command buffer, created only when needed
     id<MTLCommandBuffer> own_cb = nil;
     if (!blit) { own_cb = [queue commandBuffer]; blit = [own_cb blitCommandEncoder]; }
     uint32_t layers = t->layout.layers ? t->layout.layers : 1;
     uint64_t layer_size = linear ? t->stride * (t->layout.height ? t->layout.height : 1) : tegra_layer_size(&t->layout);
     for (uint32_t layer = 0; layer < layers; layer++) {
-        for (uint32_t lv = 0; lv < t->layout.levels; lv++) {
+        for (uint32_t lv = 0; lv < t->layout.levels && lv < b->tex.mipmapLevelCount; lv++) {
+            if (!((level_mask >> lv) & 1)) continue;
             LevelLayout l = tegra_level(&t->layout, lv);
             uint32_t row = l.wb * fi->bpb;
             uint64_t sz = (uint64_t)row * l.hb * l.d;
@@ -630,6 +639,14 @@ static void upload_texture(NvnTexture *t, TexBackend *b, id<MTLBlitCommandEncode
 
 id<MTLTexture> renderer_texture(NvnTexture *t, id<MTLBlitCommandEncoder> blit, bool for_render) {
     TexBackend *b = tex_backend(t);
+    // Levels nvnTextureWriteTexels filled go up now, also into a texture the GPU draws into (as the Vulkan backend):
+    // BOTW writes level 0 of its 32x32x32 noise that way and then renders the smaller levels from it; GPU-owned
+    // textures never read guest memory again, so the noise stayed black.
+    uint32_t written = __atomic_exchange_n(&t->cpu_levels, 0, __ATOMIC_ACQ_REL);
+    if (written) {
+        if (b->gpu_owned) upload_levels(t, b, written, blit);
+        else { b->data_hash = 0; b->checked_frame = ~0ull; b->retaken = true; upload_texture(t, b, blit); }
+    }
     if (for_render) b->gpu_owned = true;
     else if (!b->gpu_owned) upload_texture(t, b, blit);
     return b->tex;
@@ -638,13 +655,7 @@ id<MTLTexture> renderer_texture(NvnTexture *t, id<MTLBlitCommandEncoder> blit, b
 void renderer_mark_gpu_owned(NvnTexture *t) { tex_backend(t)->gpu_owned = true; }
 
 // Guest memory -> texture for every level, whoever owns it (renderer.m: linear render targets the CPU wrote).
-void renderer_texture_reload(NvnTexture *t) {
-    TexBackend *b = tex_backend(t);
-    b->data_hash = 0;
-    b->checked_frame = ~0ull;
-    b->retaken = true;
-    upload_texture(t, b, nil);
-}
+void renderer_texture_reload(NvnTexture *t) { upload_levels(t, tex_backend(t), ~0u, nil); }
 uint64_t renderer_hash_bytes(const void *p, uint64_t n) { return hash_full(p, n); }
 
 // (renderer.h) Allocated at the output scale; from now on (a target used with scaled ones: made again at the scale).
