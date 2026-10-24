@@ -653,6 +653,11 @@ id<MTLTexture> renderer_texture(NvnTexture *t, id<MTLBlitCommandEncoder> blit, b
     // textures never read guest memory again, so the noise stayed black.
     uint32_t written = __atomic_exchange_n(&t->cpu_levels, 0, __ATOMIC_ACQ_REL);
     if (written) {
+        static int logw = -1;
+        if (logw < 0) logw = getenv("SAVAGEWIND_LOG_LINEAR") != NULL;
+        if (logw && ((t->flags & 0x40) || t->width == 192 || t->width == 256))
+            LOG("[linear] WriteTexels levels %#x of %ux%u f%#x flags %#x at %llx (gpu %d)\n", written, t->width, t->height, t->format, t->flags,
+                (unsigned long long)t->addr, b->gpu_owned);
         if (b->gpu_owned) upload_levels(t, b, written, blit);
         else { b->data_hash = 0; b->checked_frame = ~0ull; b->retaken = true; upload_texture(t, b, blit); }
     }

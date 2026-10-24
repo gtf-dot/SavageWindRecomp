@@ -163,7 +163,8 @@ static int debug_pass_no;
 // takes the memory's texels. Without either, Link stood above or in the terrain drawn, and tiles kept the heights of
 // whatever was there before (ghost boxes over the Great Plateau; the Metal image at a memory is shared, so a tile
 // made again there never took its new contents).
-typedef struct { uint64_t addr, size, hash; void *tex, *pending; } LinearMem;  // pending: the command buffer copying back (retained)
+typedef struct { uint64_t addr, size, hash, sampled_frame; void *tex, *pending; } LinearMem;  // pending: the command buffer copying back (retained)
+static bool log_linear(void) { static int on = -1; if (on < 0) on = getenv("SAVAGEWIND_LOG_LINEAR") != NULL; return on; }
 #define LINEAR_MEM 1024  // (the Vulkan backend keeps 64; here an untracked tile would keep the shared image's old texels)
 static LinearMem linear_mem[LINEAR_MEM];
 static int nlinear_mem;
@@ -193,7 +194,7 @@ static bool linear_target_ok(NvnTexture *t, const NvnTextureView *v, bool has_vi
 static int linear_mem_find(uint64_t addr, uint64_t size) {
     for (int i = 0; i < nlinear_mem; i++) if (linear_mem[i].addr == addr && linear_mem[i].size == size) return i;
     if (nlinear_mem == LINEAR_MEM) return -1;
-    linear_mem[nlinear_mem] = (LinearMem){addr, size, 0, NULL, NULL};
+    linear_mem[nlinear_mem] = (LinearMem){addr, size, 0, 0, NULL, NULL};
     return nlinear_mem++;
 }
 
@@ -227,13 +228,46 @@ static void linear_target_begin(NvnTexture *t, const NvnTextureView *v, bool has
         m->tex = tex;
         if (reload) {
             static int nlog;
-            if (nlog++ < 6) LOG("[linear] target %ux%u f%#x at %llx takes guest memory (%s)\n", t->width, t->height, t->format,
+            if (nlog++ < 6 || log_linear()) LOG("[linear] target %ux%u f%#x at %llx takes guest memory (%s)\n", t->width, t->height, t->format,
                                 (unsigned long long)t->addr, i >= n ? "first use" : m->tex != tex ? "new texture" : "CPU wrote it");
             renderer_texture_reload(t);
         }
     }
 record:
     if (pass_nlinear < 8) pass_linear[pass_nlinear++] = t;
+}
+
+// A linear target a draw samples or a copy reads (sampled_texture) while the GPU owns it: the CPU may have filled its
+// memory since the GPU last wrote it. Once a frame per target, the memory's hash against the last one known; the
+// texture takes the memory when it changed. (Only targets a pass already drew into: a copy's destination was never
+// in the memory, and would be clobbered by it.)
+static void linear_target_sampled(NvnTexture *t) {
+    uint64_t stride, row;
+    if (!(t->flags & 0x40) || !renderer_is_gpu_owned(t) || !linear_target_ok(t, NULL, false, &stride, &row)) return;
+    uint64_t size = stride * t->height;
+    int i = -1;
+    for (int k = 0; k < nlinear_mem; k++) if (linear_mem[k].addr == t->addr && linear_mem[k].size == size) { i = k; break; }
+    if (i < 0) return;
+    LinearMem *m = &linear_mem[i];
+    extern uint64_t renderer_present_count(void);
+    uint64_t f = renderer_present_count();
+    if (m->sampled_frame == f) return;
+    m->sampled_frame = f;
+    const void *mem = (const void *)(uintptr_t)t->addr;
+    if (m->pending) {
+        id<MTLCommandBuffer> c = (__bridge id<MTLCommandBuffer>)m->pending;
+        if (c.status < MTLCommandBufferStatusCompleted) return;  // (the GPU's copy back is on its way: the memory is the GPU's)
+        CFRelease(m->pending);
+        m->pending = NULL;
+        m->hash = renderer_hash_bytes(mem, size);  // (just landed: the memory is what the texture holds)
+        return;
+    }
+    uint64_t h = renderer_hash_bytes(mem, size);
+    if (h == m->hash) return;
+    m->hash = h;
+    static int nlog;
+    if (nlog++ < 10 || log_linear()) LOG("[linear] sampled target %ux%u f%#x at %llx takes guest memory (CPU wrote it)\n", t->width, t->height, t->format, (unsigned long long)t->addr);
+    renderer_texture_reload(t);
 }
 
 // After the pass (end_pass): what it drew into its linear targets goes back to guest memory.
@@ -1424,6 +1458,7 @@ static id<MTLTexture> apply_swizzle(id<MTLTexture> tex, NvnTexture *t, const Nvn
 static id<MTLTexture> sampled_texture(NvnTexture *t, const NvnTextureView *v, bool has_view, int want_type) {
     // uploads (if the CPU-side contents changed) go into their own command buffer, committed before
     // the current one so they land first
+    linear_target_sampled(t);
     id<MTLTexture> tex = view_texture(t, v, has_view, false, nil);
     tex = apply_swizzle(tex, t, v, has_view);
     MTLTextureType want = mtl_type_for(want_type);
@@ -1737,6 +1772,26 @@ static void bind_textures(int stage, ShaderInfo *si) {
             renderer_save_texture(tex, path);
             snprintf(path, sizeof path, "build/dtex_%03d_%d_a.png", dn - 1, i);
             renderer_save_texture_alpha(tex, path);
+        }
+        // SAVAGEWIND_DUMP_ARRAYS=1 (debug frame): the first layers of each 2D array texture a fragment stage binds, once
+        // per texture, as build/dtexa_<n>_<slot>_l<layer>.png (the terrain's material atlases and arrays)
+        if (g_debug_frame && tex.textureType == MTLTextureType2DArray && stage == 1 && getenv("SAVAGEWIND_DUMP_ARRAYS")) {
+            static void *seen[64];
+            static int nseen, dn;
+            bool known = false;
+            for (int k = 0; k < nseen; k++) known |= seen[k] == (__bridge void *)tex;
+            if (!known && nseen < 64) {
+                seen[nseen++] = (__bridge void *)tex;
+                for (NSUInteger l = 0; l < tex.arrayLength && l < 8; l++) {
+                    id<MTLTexture> lv = [tex newTextureViewWithPixelFormat:tex.pixelFormat textureType:MTLTextureType2D levels:NSMakeRange(0, 1) slices:NSMakeRange(l, 1)];
+                    char path[128];
+                    snprintf(path, sizeof path, "build/dtexa_%03d_%d_l%lu.png", dn, i, (unsigned long)l);
+                    if (lv) renderer_save_texture(lv, path);
+                }
+                LOG("[dtexa] %03d slot %d: %lux%lu x%lu fmt %lu %s\n", dn, i, (unsigned long)tex.width, (unsigned long)tex.height,
+                    (unsigned long)tex.arrayLength, (unsigned long)tex.pixelFormat, tex.label.UTF8String);
+                dn++;
+            }
         }
         if (stage == 0) { [enc setVertexTexture:tex atIndex:i]; [enc setVertexSamplerState:smp atIndex:i]; }
         else { [enc setFragmentTexture:tex atIndex:i]; [enc setFragmentSamplerState:smp atIndex:i]; }
@@ -2123,7 +2178,17 @@ static void draw(CmdRec *r, bool indexed) {
     bool addr_hit = false;
     for (int i = 0; log_rt_addr && i < st.rt.ncolor; i++)
         if (st.rt.color[i] && st.rt.color[i]->addr <= log_rt_addr + 0x40000 && st.rt.color[i]->addr + 0x40000 >= log_rt_addr) addr_hit = true;
-    if (addr_hit) LOG("[rtaddr] rt0 addr %llx\n", st.rt.color[0] ? st.rt.color[0]->addr : 0);
+    if (addr_hit) {
+        LOG("[rtaddr] rt0 addr %llx", st.rt.color[0] ? st.rt.color[0]->addr : 0);
+        for (int i = 0; i < st.rt.ncolor; i++)
+            if (st.rt.color[i])
+                LOG(" | c%d %ux%ux%u target %u f%#x at %llx view %d lv %u+%u ly %u+%u", i, st.rt.color[i]->width, st.rt.color[i]->height, st.rt.color[i]->depth,
+                    st.rt.color[i]->target, st.rt.color[i]->format, (unsigned long long)st.rt.color[i]->addr, st.rt.has_cview[i] ? st.rt.cview[i].setmask : -1,
+                    st.rt.cview[i].base_level, st.rt.cview[i].num_levels, st.rt.cview[i].min_layer, st.rt.cview[i].num_layers);
+        LOG("\n");
+        static int described;
+        if (!described++) { extern void nvn_debug_textures_at(uint64_t a); nvn_debug_textures_at(log_rt_addr); }
+    }
     if (g_debug_frame || addr_hit || (log_rt_w && st.rt.ncolor && st.rt.color[0] && (int)st.rt.color[0]->width == log_rt_w &&
                           (int)st.rt.color[0]->height == log_rt_h))
         debug_draw(pr, r, indexed);
@@ -2695,6 +2760,9 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
     snap_reason = "tex2tex"; snapshots_invalidate(NULL);
     NvnTexture *st_ = (NvnTexture *)(uintptr_t)src->tex, *dt = (NvnTexture *)(uintptr_t)dst->tex;
     if (!st_ || !dt) return;
+    if (log_linear() && ((st_->flags | dt->flags) & 0x40))
+        LOG("[linear] copy %ux%u f%#x flags %#x at %llx (gpu %d) -> %ux%u f%#x flags %#x at %llx\n", st_->width, st_->height, st_->format, st_->flags,
+            (unsigned long long)st_->addr, renderer_is_gpu_owned(st_), dt->width, dt->height, dt->format, dt->flags, (unsigned long long)dt->addr);
     end_pass();
     id<MTLTexture> s = sampled_texture(st_, &src->view, src->has_view, TEXTYPE_2D);
     renderer_mark_gpu_owned(dt);
