@@ -392,15 +392,24 @@ static id<MTLTexture> view_texture(NvnTexture *t, const NvnTextureView *v, bool 
     NSUInteger nly = (v->setmask & 2) && v->num_layers ? v->num_layers : base.arrayLength - ly0;
     if (base.textureType == MTLTextureTypeCube) nly = 6;
     MTLTextureType type = base.textureType;
-    // A render target is one layer, as a 2D texture (as the Vulkan backend): BOTW clears and draws the faces of its
-    // 256x256 cube maps one at a time through a view at min_layer = face; a cube view of 6 slices from that face
-    // fails Metal's validation (slices past the 6th).
-    if (render && (type == MTLTextureType2DArray || type == MTLTextureTypeCube || type == MTLTextureTypeCubeArray)) {
-        NSUInteger slices = base.arrayLength * (type == MTLTextureType2DArray ? 1 : 6);
-        if (ly0 >= slices) ly0 = 0;
+    NSUInteger slices = base.arrayLength * (type == MTLTextureTypeCube || type == MTLTextureTypeCubeArray ? 6 : 1);
+    if (render && type == MTLTextureType3D) {
+        // One level of a 3D texture, and the pass picks the view's layer as its depth plane (begin_pass): BOTW renders
+        // the levels of its 3D noise and an 8x8x8 light volume slice by slice (as the Vulkan backend). Metal has no 2D
+        // view of a 3D texture, and slice 1 of its one slice failed Metal's validation (abort, user report 2026-10-24).
+        ly0 = 0; nly = 1;
+    } else if (render && type != MTLTextureType2D) {
+        // A render target is one layer, as a 2D texture (as the Vulkan backend): BOTW clears and draws the faces of its
+        // 256x256 cube maps one at a time through a view at min_layer = face; a cube view of 6 slices from that face
+        // fails Metal's validation (slices past the 6th).
+        if (ly0 >= slices) ly0 = slices - 1;
         type = MTLTextureType2D;
         nly = 1;
+    } else {
+        if (ly0 >= slices) ly0 = slices - 1;  // (a layer past the end: the last one, as the Vulkan backend)
+        if (ly0 + nly > slices && base.textureType != MTLTextureTypeCube) nly = slices - ly0;
     }
+    if (lv0 >= base.mipmapLevelCount) lv0 = base.mipmapLevelCount - 1;
     if (lv0 + nlv > base.mipmapLevelCount) nlv = base.mipmapLevelCount - lv0;
     if (pf == base.pixelFormat && lv0 == 0 && nlv == base.mipmapLevelCount && ly0 == 0 && type == base.textureType)
         return base;
@@ -419,6 +428,13 @@ static id<MTLTexture> view_texture(NvnTexture *t, const NvnTextureView *v, bool 
         if (nfail++ < 10) LOG("[view] FAILED %lu -> %lu (nvn %#x -> %#x)\n", (unsigned long)base.pixelFormat, (unsigned long)pf, t->format, v->format);
     }
     return got;
+}
+
+// The depth plane a pass draws of a 3D render target: the view's layer (view_texture gives the whole level).
+static NSUInteger render_depth_plane(id<MTLTexture> tex, const NvnTextureView *v, bool has_view) {
+    if (tex.textureType != MTLTextureType3D) return 0;
+    NSUInteger z = has_view && (v->setmask & 2) ? v->min_layer : 0;
+    return z < tex.depth ? z : tex.depth - 1;
 }
 
 // ------------------------------------------------------------------ render passes
@@ -455,6 +471,7 @@ static void begin_pass(void) {
         renderer_mark_gpu_owned(t);
         id<MTLTexture> tex = view_texture(t, &st.rt.cview[i], st.rt.has_cview[i], true, nil);
         rp.colorAttachments[i].texture = tex;
+        rp.colorAttachments[i].depthPlane = render_depth_plane(tex, &st.rt.cview[i], st.rt.has_cview[i]);
         rp.colorAttachments[i].loadAction = MTLLoadActionLoad;
         // reshaped output: areas outside the game's 16:9 drawing (interiors, fades) start black each frame
         extern bool renderer_texture_first_write(NvnTexture *t);
@@ -474,6 +491,7 @@ static void begin_pass(void) {
         id<MTLTexture> tex = view_texture(st.rt.depth, &st.rt.dview, st.rt.has_dview, true, nil);
         if (renderer_format_is_depth(st.rt.depth->format) && st.rt.depth->format != 0x31) {
             rp.depthAttachment.texture = tex;
+            rp.depthAttachment.depthPlane = render_depth_plane(tex, &st.rt.dview, st.rt.has_dview);
             rp.depthAttachment.loadAction = MTLLoadActionLoad;
             rp.depthAttachment.storeAction = MTLStoreActionStore;
         }
@@ -2566,7 +2584,7 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
         id<MTLBlitCommandEncoder> b = [cb() blitCommandEncoder];
         [b copyFromTexture:s sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(sx0, sy0, 0)
                 sourceSize:MTLSizeMake(MIN(sw, dw), MIN(sh, dh), 1) toTexture:d destinationSlice:0 destinationLevel:0
-         destinationOrigin:MTLOriginMake(dx0, dy0, 0)];
+         destinationOrigin:MTLOriginMake(dx0, dy0, render_depth_plane(d, &dst->view, dst->has_view))];
         [b endEncoding];
         return;
     }
