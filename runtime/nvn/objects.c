@@ -140,7 +140,12 @@ static bool host_work(void) {
 // SAVAGEWIND_TIMELINE=<first frame>:<frames>: "[tl]" lines (ms, guest thread, event) for submits, fences, GPU
 // waits and presents of those presented frames: who waits for whom within a frame.
 uint64_t renderer_present_count(void);
+#ifdef __APPLE__
+uint64_t renderer_completed_seq(void);  // the Metal backend's (renderer.m); the "[tl]" line below is shared
+#define vk_completed_seq renderer_completed_seq
+#else
 uint64_t vk_completed_seq(void);
+#endif
 uint64_t renderer_fence_seq(void);
 bool nvn_timeline(void) {
     static int64_t from = -2, count;

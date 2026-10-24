@@ -709,20 +709,29 @@ def emit_asm_batch(batch):
         lines.append(f'mov x{s}, %{len(ins) - 1}')
     for v in sorted(vregs):
         lines.append(f'ldr q{v}, [%0, #{OFF_V + 16 * v}]')
+    # The flags go through a scratch register of their own: one that holds a guest register would be overwritten
+    # with the NZCV value (a batch of 9 address registers plus an fcmp read a pointer as 0x60000000, BOTW 1.9.0's
+    # title screen after ~50 s on macOS). No free register: the batch is split (gen.py retries without the last).
+    used = set(gmap.values()) | {s for s, _ in consts}
+    nz = None
     if flags:
-        lines.append(f'ldr x16, [%0, #{OFF_NZCV}]')
-        lines.append('msr nzcv, x16')
+        free = [s for s in SCRATCH if s not in used]
+        if not free:
+            raise Unsupported('scratch exhausted')
+        nz = free[0]
+        lines.append(f'ldr x{nz}, [%0, #{OFF_NZCV}]')
+        lines.append(f'msr nzcv, x{nz}')
     lines += [f'.inst 0x{x:08x}' for x in words]
     if flags:
-        lines.append('mrs x16, nzcv')
-        lines.append(f'str x16, [%0, #{OFF_NZCV}]')
+        lines.append(f'mrs x{nz}, nzcv')
+        lines.append(f'str x{nz}, [%0, #{OFF_NZCV}]')
     for v in sorted(vregs):
         lines.append(f'str q{v}, [%0, #{OFF_V + 16 * v}]')
     for g, s in gmap.items():
         off = OFF_SP if g == 'sp' else OFF_X + 8 * g
         lines.append(f'str x{s}, [%0, #{off}]')
     clob = [f'"v{v}"' for v in sorted(vregs)]
-    clob += [f'"x{s}"' for s in sorted(set(gmap.values()) | {s for s, _ in consts} | ({16} if flags else set()))]
+    clob += [f'"x{s}"' for s in sorted(used | ({nz} if flags else set()))]
     clob += ['"cc"', '"memory"']
     body = '\\n\\t'.join(lines)
     return f'__asm__ volatile("{body}" :: {", ".join(ins)} : {", ".join(clob)});'

@@ -229,7 +229,7 @@ def _vfr_ratio(gen, a):
 
 def _gui_speed(gen, a):
     assert _word(gen, a) == 0xbd0b2100, hex(_word(gen, a))  # str s0, [x8, #0xb20]
-    return ('{ extern float rt_gui_speed(float); union { uint32_t u; float f; } s = { .u = (uint32_t)VS32(0) }; '
+    return ('{ extern float rt_gui_speed(float); union { uint32_t u; float f; } s = { .u = (uint32_t)c->v[0] }; '  # (s0: the low lane of v0 in both SIMD modes; VS32 is the portable C lowering's)
             's.f = rt_gui_speed(s.f); ST32(c->x[8] + 0xb20, s.u); }'
             f'  /* {a:#x}: str s0, [x8, #0xb20] (GUI speed) */')
 

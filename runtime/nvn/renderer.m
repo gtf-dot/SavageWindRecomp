@@ -270,6 +270,19 @@ uint64_t renderer_fence_seq(void) {
     return q;
 }
 
+// Newest submission the GPU has completed (they complete in order on the one queue); 0 = none known.
+uint64_t renderer_completed_seq(void) {
+    uint64_t done = 0;
+    pthread_mutex_lock(&cb_lock);
+    for (uint64_t n = 0; n < CB_HIST && n < submit_seq; n++) {
+        uint64_t seq = submit_seq - n;
+        id<MTLCommandBuffer> c = cb_hist[seq % CB_HIST];
+        if (c && c.status >= MTLCommandBufferStatusCompleted) { done = seq; break; }
+    }
+    pthread_mutex_unlock(&cb_lock);
+    return done;
+}
+
 // Wait until submission `seq` has completed (0 = nothing to wait for).
 void renderer_wait_seq(uint64_t seq) {
     if (!seq) return;
@@ -369,7 +382,15 @@ static id<MTLTexture> view_texture(NvnTexture *t, const NvnTextureView *v, bool 
     NSUInteger nly = (v->setmask & 2) && v->num_layers ? v->num_layers : base.arrayLength - ly0;
     if (base.textureType == MTLTextureTypeCube) nly = 6;
     MTLTextureType type = base.textureType;
-    if (render && (type == MTLTextureType2DArray || type == MTLTextureTypeCube) && nly == 1) type = MTLTextureType2D;
+    // A render target is one layer, as a 2D texture (as the Vulkan backend): BOTW clears and draws the faces of its
+    // 256x256 cube maps one at a time through a view at min_layer = face; a cube view of 6 slices from that face
+    // fails Metal's validation (slices past the 6th).
+    if (render && (type == MTLTextureType2DArray || type == MTLTextureTypeCube || type == MTLTextureTypeCubeArray)) {
+        NSUInteger slices = base.arrayLength * (type == MTLTextureType2DArray ? 1 : 6);
+        if (ly0 >= slices) ly0 = 0;
+        type = MTLTextureType2D;
+        nly = 1;
+    }
     if (lv0 + nlv > base.mipmapLevelCount) nlv = base.mipmapLevelCount - lv0;
     if (pf == base.pixelFormat && lv0 == 0 && nlv == base.mipmapLevelCount && ly0 == 0 && type == base.textureType)
         return base;
@@ -535,6 +556,7 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
     id<MTLLibrary> lib = clear_lib(index < 0 ? 0 : index);
     pd.vertexFunction = [lib newFunctionWithName:@"vs"];
     static NSString *const fs[] = {@"fs_f", @"fs_i", @"fs_u"};
+    if (kind < 0 || kind > 2) kind = 0;  // (as the Vulkan backend: anything else is a float clear)
     pd.fragmentFunction = [lib newFunctionWithName:index >= 0 ? fs[kind] : @"fs_none"];
     attachment_formats(pd);
     for (int i = 0; i < 8; i++) pd.colorAttachments[i].writeMask = MTLColorWriteMaskNone;
