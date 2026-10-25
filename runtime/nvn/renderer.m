@@ -1193,6 +1193,12 @@ static MTLStencilOperation stencil_op(uint8_t o) {
     }
 }
 
+static int rt_kind(uint32_t f);
+// The format color target i is drawn in: its view's when the view sets one (BOTW draws BC4 blocks through an
+// RGBA16Uint view: the shader must output integers there, or the pipeline fails and nothing is drawn).
+static uint32_t rt_format(int i) {
+    return st.rt.has_cview[i] && (st.rt.cview[i].setmask & 4) ? st.rt.cview[i].format : st.rt.color[i]->format;
+}
 static int rt_kind(uint32_t f) {
     switch (f) {
     case 0x03: case 0x08: case 0x0B: case 0x0F: case 0x14: case 0x17: case 0x27: case 0x2C: case 0x2F: case 0x3E: return 2;
@@ -2168,7 +2174,7 @@ static void draw(CmdRec *r, bool indexed) {
     vkey.flip_y = fkey.flip_y = nvn_window_origin() == 0;
     vkey.depth_minus_one = nvn_depth_mode() == 0;
     for (int i = 0; i < st.nattrib; i++) vkey.attr_kind[i] = (uint8_t)attr_kind(st.attrib[i] & 0xFF);
-    for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(st.rt.color[i]->format);
+    for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(rt_format(i));
     Prog *pr = get_program(st.program, &vkey, &fkey);
     if (pr && !pr->ready && g_draw_must_wait) program_wait(pr);
     if (!pr || !pr->ready) { stat_skipped++; return; }
@@ -2294,7 +2300,7 @@ static void draw(CmdRec *r, bool indexed) {
         ca.writeMask = (m & 1 ? MTLColorWriteMaskRed : 0) | (m & 2 ? MTLColorWriteMaskGreen : 0) |
                        (m & 4 ? MTLColorWriteMaskBlue : 0) | (m & 8 ? MTLColorWriteMaskAlpha : 0);
         bool blend_on = (st.color_state[0] >> i) & 1;
-        if (blend_on && !rt_kind(st.rt.color[i]->format)) {
+        if (blend_on && !rt_kind(rt_format(i))) {
             uint8_t *b = st.blend[i];
             ca.blendingEnabled = YES;
             ca.sourceRGBBlendFactor = blend_factor(b[1]);
