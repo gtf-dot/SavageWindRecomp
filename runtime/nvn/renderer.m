@@ -15,6 +15,7 @@
 #include "maxwell/shader.h"
 #include "nvn.h"
 #include "renderer.h"
+#include "../settings.h"
 
 static id<MTLDevice> dev;
 static id<MTLCommandBuffer> cmdbuf;
@@ -692,6 +693,7 @@ static NSUInteger render_depth_plane(id<MTLTexture> tex, const NvnTextureView *v
 // ------------------------------------------------------------------ render passes
 static __unsafe_unretained id last_bias_enc;  // encoder the depth bias was last set on
 
+static bool g_addr_hit_draw;  // (SAVAGEWIND_LOG_RT_ADDR) the draw being logged targets the address: log its textures too
 static uint8_t g_pass_drop;  // (repeated attachments: rt_drop_mask)
 static uint8_t rt_drop_mask(void);
 static void begin_pass(void) {
@@ -1249,10 +1251,32 @@ void shader_cache_warm(void) {
     });
 }
 
-static bool sync_shaders(void) {  // SAVAGEWIND_SYNC_SHADERS: compile on first use, blocking (deterministic tests)
-    static int v = -1;
-    if (v < 0) v = getenv("SAVAGEWIND_SYNC_SHADERS") != NULL;
-    return v;
+// Shaders and pipelines compile where they are first needed, the draw waiting for them (a short stutter the first time
+// an effect appears), unless the "Asynchronous shaders" setting is on: then they compile on Metal's threads and draws
+// that need them are skipped meanwhile (as the Vulkan backend). Skipping lost what the game draws only once: BOTW
+// writes a terrain tile's materials into its material atlas when the tile streams in, so the atlas's near layers
+// stayed empty and the ground near Link was one flat colour with no grass (user report 2026-10-24, Great Plateau).
+// SAVAGEWIND_SYNC_SHADERS / SAVAGEWIND_ASYNC_SHADERS override the setting.
+static bool sync_shaders(void) {
+    static int env = -1;
+    if (env < 0) env = getenv("SAVAGEWIND_SYNC_SHADERS") ? 1 : getenv("SAVAGEWIND_ASYNC_SHADERS") ? 0 : 2;
+    return env == 2 ? !g_settings.async_shaders : env;
+}
+// With asynchronous shaders, a draw whose attachments are all offscreen textures (none drawn at the output scale: a
+// terrain atlas, a cube map face, a thumbnail) still waits for its shader and pipeline: such targets keep what is drawn
+// into them, often drawn once. Scene draws, redrawn every frame, are the ones skipping saves a stutter on.
+static bool g_draw_must_wait;
+static bool draw_offscreen(void) {
+    bool any = false;
+    for (int i = 0; i < st.rt.ncolor && i < 8; i++)
+        if (st.rt.color[i]) { if (renderer_texture_scalable(st.rt.color[i])) return false; any = true; }
+    if (st.rt.depth) { if (renderer_texture_scalable(st.rt.depth)) return false; any = true; }
+    return any;
+}
+static bool compile_now(void) { return sync_shaders() || g_draw_must_wait; }
+// A compile already running on another thread: wait for it (offscreen draws), at most 5 s.
+static void program_wait(Prog *pr) {
+    for (int n = 0; n < 50000 && !pr->ready && !__atomic_load_n(&pr->failed, __ATOMIC_ACQUIRE); n++) usleep(100);  // (ready: _Atomic)
 }
 
 static void compile_program(Prog *pr) {
@@ -1345,7 +1369,7 @@ static Prog *get_program(NvnProgram *p, ShaderKey *vkey, ShaderKey *fkey) {
         f = fopen(path, "w"); fputs(pr->fi->msl, f); fclose(f);
     }
     shader_cache_note(pr->vi->msl, pr->fi->msl);
-    if (sync_shaders()) {
+    if (compile_now()) {
         compile_program(pr);
         return pr->failed ? nil : pr;
     }
@@ -1716,7 +1740,7 @@ static void bind_textures(int stage, ShaderInfo *si) {
                         fc = [fc newTextureViewWithPixelFormat:fc.pixelFormat textureType:MTLTextureType2DArray levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1)];
                     tex = fc;
                 }
-            if (g_debug_frame && e->tex && e->tex->addr) {
+            if ((g_debug_frame || g_addr_hit_draw) && e->tex && e->tex->addr) {
                 uint64_t total = tegra_total_size(&e->tex->layout), nz = 0;
                 const uint8_t *p = (const uint8_t *)(uintptr_t)e->tex->addr;
                 for (uint64_t k = 0; k < total; k++) nz += p[k] != 0;
@@ -2132,6 +2156,7 @@ static uint64_t pipeline_state_hash(Prog *pr) {
 
 static void draw(CmdRec *r, bool indexed) {
     if (!st.program) { stat_skipped++; return; }
+    g_draw_must_wait = !sync_shaders() && draw_offscreen();
     static bool logged_modes;
     if (!logged_modes) {
         logged_modes = true;
@@ -2145,6 +2170,7 @@ static void draw(CmdRec *r, bool indexed) {
     for (int i = 0; i < st.nattrib; i++) vkey.attr_kind[i] = (uint8_t)attr_kind(st.attrib[i] & 0xFF);
     for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(st.rt.color[i]->format);
     Prog *pr = get_program(st.program, &vkey, &fkey);
+    if (pr && !pr->ready && g_draw_must_wait) program_wait(pr);
     if (!pr || !pr->ready) { stat_skipped++; return; }
     {   // Interiors/dungeons draw a 16:9 backdrop quad over the still-rendered overworld: frames that
         // draw it are presented cropped to 16:9 (see backend_present).
@@ -2178,6 +2204,7 @@ static void draw(CmdRec *r, bool indexed) {
     bool addr_hit = false;
     for (int i = 0; log_rt_addr && i < st.rt.ncolor; i++)
         if (st.rt.color[i] && st.rt.color[i]->addr <= log_rt_addr + 0x40000 && st.rt.color[i]->addr + 0x40000 >= log_rt_addr) addr_hit = true;
+    g_addr_hit_draw = addr_hit;  // (the texture binds of this draw log their sources too)
     if (addr_hit) {
         LOG("[rtaddr] rt0 addr %llx", st.rt.color[0] ? st.rt.color[0]->addr : 0);
         for (int i = 0; i < st.rt.ncolor; i++)
@@ -2196,6 +2223,7 @@ static void draw(CmdRec *r, bool indexed) {
     if (memcmp(fbfetch_map, fkey.fbfetch, sizeof fbfetch_map)) {  // (fbfetch_map) the framebuffer fetch variant
         memcpy(fkey.fbfetch, fbfetch_map, sizeof fkey.fbfetch);
         pr = get_program(st.program, &vkey, &fkey);
+        if (pr && !pr->ready && g_draw_must_wait) program_wait(pr);
         if (!pr || !pr->ready) { stat_skipped++; return; }
     }
     // this draw's writes make snapshots of its attachments stale
@@ -2302,10 +2330,17 @@ static void draw(CmdRec *r, bool indexed) {
             id done = ready_pipes[pk];
             if (done) { [ready_pipes removeObjectForKey:pk]; cache[pk] = done; pobj = done; }
         }
+        for (int n = 0; pobj == pending && g_draw_must_wait && n < 50000; n++) {  // (offscreen: wait for the build)
+            usleep(100);
+            @synchronized(ready_pipes) {
+                id done = ready_pipes[pk];
+                if (done) { [ready_pipes removeObjectForKey:pk]; cache[pk] = done; pobj = done; }
+            }
+        }
         if (pobj == pending) { stat_skipped++; return; }
     }
     if (!pobj) {
-        if (sync_shaders()) {
+        if (compile_now()) {
             NSError *err;
             pobj = TIMED_COMPILE([dev newRenderPipelineStateWithDescriptor:pd error:&err]);
             if (!pobj) {
